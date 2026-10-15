@@ -1,3 +1,5 @@
+index_js.txt
+
 // Creator Congress campaign bot
 // - Posts Active proposals (with "Post to Discord" checked) to the campaign channel
 // - Logs ✅ reactions to the Campaign Commitments table; un-reacting marks them Withdrawn
@@ -403,6 +405,7 @@ async function poll() {
   polling = true;
   try {
     await syncCampaignPosts();
+    log('Checked Airtable for campaigns to post/close');
   } catch (err) {
     log('poll error', err);
   } finally {
@@ -412,8 +415,20 @@ async function poll() {
 
 client.once('clientReady', async () => {
   log(`Logged in as ${client.user.tag}`);
-  await new REST().setToken(DISCORD_TOKEN).put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands });
-  log('Slash commands registered');
+  const guild = client.guilds.cache.get(DISCORD_GUILD_ID);
+  log(guild ? `Found server: ${guild.name}` : `WARNING: bot is not in server ${DISCORD_GUILD_ID}. Check DISCORD_GUILD_ID or re-invite the bot.`);
+  try {
+    const ch = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
+    log(`Found campaign channel: #${ch.name}`);
+  } catch (err) {
+    log(`WARNING: can't open campaign channel ${CAMPAIGN_CHANNEL_ID}: ${err.message}. Check CAMPAIGN_CHANNEL_ID and the bot's channel permissions.`);
+  }
+  try {
+    await new REST().setToken(DISCORD_TOKEN.trim()).put(Routes.applicationGuildCommands(DISCORD_CLIENT_ID, DISCORD_GUILD_ID), { body: commands });
+    log('Slash commands registered');
+  } catch (err) {
+    log(`WARNING: couldn't register slash commands: ${err.message}. Check DISCORD_CLIENT_ID and DISCORD_GUILD_ID.`);
+  }
   await poll();
   try {
     await reconcileOpenCampaigns();
@@ -424,4 +439,30 @@ client.once('clientReady', async () => {
   setInterval(poll, Number(POLL_SECONDS) * 1000);
 });
 
-client.login(DISCORD_TOKEN);
+// ---------- diagnostics ----------
+process.on('unhandledRejection', (err) => log('UNHANDLED REJECTION', err));
+process.on('uncaughtException', (err) => log('UNCAUGHT EXCEPTION', err));
+client.on('error', (err) => log('Discord client error', err));
+client.on('warn', (m) => log('Discord warning', m));
+client.on('shardDisconnect', (e) => log(`Discord disconnected (code ${e?.code})`));
+if (process.env.DEBUG) client.on('debug', (m) => log('[debug]', m));
+
+log('Bot starting…');
+log(
+  `Config check: token ${DISCORD_TOKEN.trim().length} chars` +
+    (DISCORD_TOKEN !== DISCORD_TOKEN.trim() ? ' (HAS EXTRA SPACES — remove them)' : '') +
+    `, client ID ${DISCORD_CLIENT_ID}, server ID ${DISCORD_GUILD_ID}, channel ID ${CAMPAIGN_CHANNEL_ID}`
+);
+setTimeout(() => {
+  if (!client.isReady()) log('Still not connected to Discord after 30s. Check DISCORD_TOKEN, or set DEBUG=1 for details.');
+}, 30_000);
+
+client
+  .login(DISCORD_TOKEN.trim())
+  .then(() => log('Discord login accepted, waiting for ready…'))
+  .catch((err) => {
+    log('DISCORD LOGIN FAILED:', err.code || '', err.message);
+    process.exit(1);
+  });
+
+Displaying index_js.txt.
