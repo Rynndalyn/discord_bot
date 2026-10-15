@@ -270,6 +270,15 @@ async function resolveReaction(reaction, user) {
   return campaign ? { campaign, messageId: reaction.message.id } : null;
 }
 
+// Only nudge unlinked members to /link once: on their very first sign-up (survives restarts).
+const reminded = new Set();
+async function isFirstSignup(userId) {
+  if (reminded.has(userId)) return false;
+  reminded.add(userId);
+  const rows = await at.list(K.table, { formula: `{${K.names.discordUserId}}=${at.q(userId)}`, fields: [K.f.title], maxRecords: 2 });
+  return rows.length <= 1;
+}
+
 client.on('messageReactionAdd', async (reaction, user) => {
   try {
     const hit = await resolveReaction(reaction, user);
@@ -280,7 +289,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
       return;
     }
     const { member, changed } = await commit(user, hit.messageId, hit.campaign);
-    if (changed && !member) {
+    if (changed && !member && (await isFirstSignup(user.id))) {
       await dm(
         user,
         `Thanks for signing up for **${hit.campaign.name}**! We've recorded it, but your Discord account isn't linked to your Creator Congress profile yet. ` +
