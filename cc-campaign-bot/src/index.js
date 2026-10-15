@@ -25,6 +25,7 @@ const {
   SIGNUP_EMOJI = '✅',
   POLL_SECONDS = '120',
   PORTAL_URL = '',
+  GUIDE_URL = '',
 } = process.env;
 
 for (const [k, v] of Object.entries({ DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, CAMPAIGN_CHANNEL_ID, AIRTABLE_TOKEN: process.env.AIRTABLE_TOKEN })) {
@@ -367,6 +368,7 @@ const commands = [
     .addStringOption((o) => o.setName('email').setDescription('The email you applied with').setRequired(true)),
   new SlashCommandBuilder().setName('mycampaigns').setDescription('See the campaigns you have signed up for and your expected pay'),
   new SlashCommandBuilder().setName('roster').setDescription('For organizations: see which creators signed up for your campaigns'),
+  new SlashCommandBuilder().setName('help').setDescription('How Creator Congress campaigns work'),
 ].map((c) => c.toJSON());
 
 const idList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
@@ -589,6 +591,24 @@ async function handleRoster(interaction) {
   return interaction.editReply({ embeds: [e] });
 }
 
+async function handleHelp(interaction) {
+  const e = new EmbedBuilder()
+    .setAuthor({ name: 'CREATOR CONGRESS' })
+    .setTitle('📖 How campaigns work')
+    .setColor(0x2ecc71)
+    .setDescription(`Partner organizations post campaigns in <#${CAMPAIGN_CHANNEL_ID}>. Here's everything you need.`)
+    .addFields(
+      { name: '1️⃣  Link your account (one time)', value: 'Type `/link your@email.com` using the email you applied with.' },
+      { name: `2️⃣  Sign up`, value: `React ${SIGNUP_EMOJI} on any campaign in <#${CAMPAIGN_CHANNEL_ID}>. Remove your reaction to withdraw.` },
+      { name: '3️⃣  Track your campaigns', value: 'Type `/mycampaigns` to see what you joined and your expected pay (an estimate, not a confirmed payment).' },
+      { name: '🏢  Partner organizations', value: '`/link` with your organization’s application email, then `/roster` to see who signed up.' },
+      { name: '🔒  Good to know', value: 'Reactions are public. Command replies are private to you. Closed campaigns don’t take sign-ups.' }
+    )
+    .setFooter({ text: 'Questions? Message a Creator Congress team member.' });
+  if (GUIDE_URL) e.addFields({ name: '📄  Full guide', value: `[Read the full how-to guide](${GUIDE_URL})` });
+  return interaction.editReply({ embeds: [e] });
+}
+
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   try {
@@ -596,6 +616,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'link') await handleLink(interaction);
     if (interaction.commandName === 'mycampaigns') await handleMyCampaigns(interaction);
     if (interaction.commandName === 'roster') await handleRoster(interaction);
+    if (interaction.commandName === 'help') await handleHelp(interaction);
   } catch (err) {
     log('command error', err);
     const msg = 'Something went wrong on our end. Please try again in a minute.';
