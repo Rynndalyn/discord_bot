@@ -46,6 +46,23 @@ export const MEMBERS = {
   },
 };
 
+export const ORGS = {
+  table: 'tblpikwO1pFDhJEhu', // Organization Applications
+  f: {
+    organization: 'fldi31QP3PtSTtmC7',
+    firstName: 'fldpSw1WyaNye5j2N',
+    email: 'fldtiFtu2lxwEsKH1',
+    approved: 'fldM7s2R2XJV8FKdq',
+    proposals: 'fldu8NrBaV7t5hrva',
+    discordUserId: 'fldm5KUnv3SWbucA0', // comma-separated: several staff can link to one org
+  },
+  names: {
+    email: 'Email',
+    approved: 'Approved',
+    discordUserId: 'Discord User ID',
+  },
+};
+
 export const COMMITMENTS = {
   table: 'tblpZNubuZE1AECjg', // Campaign Commitments
   f: {
@@ -61,6 +78,8 @@ export const COMMITMENTS = {
     campaignName: 'fldFfllRzd7UOhJBN',
     campaignStatus: 'fldBs8xCWvOkdAXvR',
     campaignEndDate: 'fldNR5Tjy2UenSfVC',
+    campaignPay: 'fldCSmEFidV7wAFqO',
+    creatorName: 'fldHc9ANL1EcmRPQU',
   },
   names: {
     status: 'Status',
