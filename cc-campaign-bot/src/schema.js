@@ -20,6 +20,7 @@ export const CAMPAIGNS = {
     discordMessageId: 'fldhnttrw4Qlxy5Nl',
     discordClosed: 'fldMECgdek4YwfOgr',
     signups: 'fldywNk9SbHcVALa7',
+    orgName: 'fldZXf8wiFZ8tMrxV',
   },
   names: {
     status: 'Active / Inactive',
@@ -80,6 +81,7 @@ export const COMMITMENTS = {
     campaignEndDate: 'fldNR5Tjy2UenSfVC',
     campaignPay: 'fldCSmEFidV7wAFqO',
     creatorName: 'fldHc9ANL1EcmRPQU',
+    orgName: 'fldcslUOMDygGUqYN',
   },
   names: {
     status: 'Status',
