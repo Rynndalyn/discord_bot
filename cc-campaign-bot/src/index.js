@@ -13,6 +13,8 @@ import {
   Routes,
   SlashCommandBuilder,
   MessageFlags,
+  ChannelType,
+  PermissionFlagsBits,
 } from 'discord.js';
 import * as at from './airtable.js';
 import { CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O } from './schema.js';
@@ -26,6 +28,9 @@ const {
   POLL_SECONDS = '120',
   PORTAL_URL = '',
   GUIDE_URL = '',
+  STAFF_ROLE_ID = '',
+  CAMPAIGN_CATEGORY = 'Active Campaigns',
+  ARCHIVE_CATEGORY = 'Archived Campaigns',
 } = process.env;
 
 for (const [k, v] of Object.entries({ DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, CAMPAIGN_CHANNEL_ID, AIRTABLE_TOKEN: process.env.AIRTABLE_TOKEN })) {
@@ -112,6 +117,9 @@ function buildEmbed(fields, { closed = false } = {}) {
   );
   const tags = [fields[C.f.proposalType], ...issues].filter(Boolean);
   if (tags.length) e.addFields({ name: '🏷️ Focus', value: tags.map((t) => `\`${t}\``).join('  ').slice(0, 1000) });
+  if (fields[C.f.longTerm] && !closed) {
+    e.addFields({ name: '🔒 Long-term campaign', value: 'Signing up adds you to a private channel for this campaign with the partner team.' });
+  }
 
   e.addFields({
     name: '​',
@@ -137,6 +145,7 @@ function scheduleRefresh(messageId, campaignId) {
         const channel = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
         const msg = await channel.messages.fetch(messageId);
         await msg.edit({ embeds: [buildEmbed(rec.fields, { closed: rec.fields[C.f.status] !== C.ACTIVE })] });
+        if (rec.fields[C.f.longTerm]) await syncCampaignChannel(rec);
       } catch (err) {
         log(`Could not refresh post ${messageId}: ${err.message}`);
       }
@@ -159,7 +168,15 @@ async function syncCampaignPosts() {
     await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false });
     campaignByMessage.set(msg.id, { id: rec.id, name: rec.fields[C.f.shortName] || 'Campaign', closed: false });
     log(`Posted campaign ${rec.id} as message ${msg.id}`);
+    if (rec.fields[C.f.longTerm]) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
   }
+
+  // 1b) Long-term box checked after the campaign was already posted → create its channel
+  const needChannel = await at.list(C.table, {
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.longTerm}}, {${C.names.discordMessageId}}!="", {${C.names.channelId}}="")`,
+    fields: campaignFields,
+  });
+  for (const rec of needChannel) await syncCampaignChannel(rec);
 
   // 2) Close: posted, no longer Active, not yet marked closed
   const toClose = await at.list(C.table, {
@@ -191,6 +208,124 @@ async function editPost(channel, rec, closed) {
   await at.update(C.table, rec.id, { [C.f.discordClosed]: closed });
   campaignByMessage.set(messageId, { id: rec.id, name: rec.fields[C.f.shortName] || 'Campaign', closed });
   log(`${closed ? 'Closed' : 'Re-opened'} campaign ${rec.id}`);
+  if (rec.fields[C.f.longTerm]) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.status]: closed ? 'closed' : C.ACTIVE } });
+}
+
+// ---------- long-term campaigns: private channel per campaign ----------
+
+const slug = (name) =>
+  String(name || 'campaign').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || 'campaign';
+
+async function ensureCategory(guild, name) {
+  await guild.channels.fetch();
+  const found = guild.channels.cache.find((c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === name.toLowerCase());
+  if (found) return found;
+  return guild.channels.create({
+    name,
+    type: ChannelType.GuildCategory,
+    permissionOverwrites: [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ManageChannels] },
+    ],
+  });
+}
+
+const VIEW = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
+const POST = [PermissionFlagsBits.SendMessages, PermissionFlagsBits.AddReactions, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks];
+
+const channelSyncs = new Map(); // campaignId -> promise, so one sync runs at a time per campaign
+function syncCampaignChannel(rec) {
+  const prev = channelSyncs.get(rec.id) || Promise.resolve();
+  const next = prev.then(() => doSyncCampaignChannel(rec)).catch((err) => log(`Channel sync failed for ${rec.id}: ${err.message}`));
+  channelSyncs.set(rec.id, next);
+  return next;
+}
+
+async function doSyncCampaignChannel(rec) {
+  const f = rec.fields;
+  if (!f[C.f.longTerm] || !f[C.f.discordMessageId]) return;
+  const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+  const closed = f[C.f.status] !== C.ACTIVE;
+  const name = f[C.f.shortName] || 'Campaign';
+
+  // Re-read the channel ID from Airtable in case an earlier sync just created it.
+  const fresh = await at.first(C.table, { formula: `RECORD_ID()=${at.q(rec.id)}`, fields: [C.f.channelId] });
+  const channelId = fresh?.fields[C.f.channelId] || f[C.f.channelId];
+  let channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
+  const isNew = !channel;
+  if (!channel) {
+    if (closed) return; // never create a channel for a closed campaign
+    const parent = await ensureCategory(guild, CAMPAIGN_CATEGORY);
+    channel = await guild.channels.create({
+      name: slug(name),
+      type: ChannelType.GuildText,
+      parent: parent.id,
+      topic: `Private space for "${name}". Everyone who signs up is added automatically.`.slice(0, 1024),
+      permissionOverwrites: [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: client.user.id, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageChannels] },
+      ],
+    });
+    await at.update(C.table, rec.id, { [C.f.channelId]: channel.id });
+    log(`Created channel #${channel.name} for ${rec.id}`);
+  }
+
+  // Who belongs: committed creators + the partner org's linked contacts (+ staff role).
+  const signups = await at.list(K.table, {
+    formula: `AND({${K.names.discordMessageId}}=${at.q(f[C.f.discordMessageId])}, {${K.names.status}}="Committed")`,
+    fields: [K.f.discordUserId],
+  });
+  const creatorIds = new Set(signups.map((r) => r.fields[K.f.discordUserId]).filter(isSnowflake));
+  const orgIds = new Set();
+  const orgLinks = f[C.f.orgLinks] || [];
+  if (orgLinks.length) {
+    const orgs = await listByIds(O.table, orgLinks, [O.f.discordUserId]);
+    orgs.forEach((o) => idList(o.fields[O.f.discordUserId]).filter(isSnowflake).forEach((id) => orgIds.add(id)));
+  }
+
+  const memberPerms = closed ? { allow: VIEW, deny: POST } : { allow: [...VIEW, ...POST] };
+  const desired = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: client.user.id, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageChannels] },
+  ];
+  if (STAFF_ROLE_ID) desired.push({ id: STAFF_ROLE_ID, allow: [...VIEW, ...POST] });
+  const members = [...new Set([...creatorIds, ...orgIds])];
+  for (const id of members) desired.push({ id, ...memberPerms });
+
+  const before = new Set(channel.permissionOverwrites.cache.filter((o) => o.type === 1).map((o) => o.id)); // 1 = member overwrite
+  await channel.permissionOverwrites.set(desired);
+
+  // Keep it in the right category: Active vs Archived.
+  const wantParent = await ensureCategory(guild, closed ? ARCHIVE_CATEGORY : CAMPAIGN_CATEGORY);
+  if (channel.parentId !== wantParent.id) {
+    await channel.setParent(wantParent.id, { lockPermissions: false });
+    await channel.permissionOverwrites.set(desired);
+    if (!isNew) await channel.send(
+      closed
+        ? '📦 This campaign is now closed. The channel is archived and read-only. Thanks, everyone!'
+        : '🔓 This campaign has been reopened. Welcome back!'
+    );
+  }
+
+  if (isNew) {
+    const postLink = `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${f[C.f.discordMessageId]}`;
+    await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle(`👋 Welcome to ${name}`.slice(0, 256))
+          .setColor(0x2ecc71)
+          .setDescription(
+            `This is the private channel for this long-term campaign. [See the campaign post](${postLink}).\n\n` +
+              'Creators who sign up are added here automatically, along with the partner organization and the Creator Congress team. ' +
+              'Removing your sign-up removes you from this channel.'
+          ),
+      ],
+    });
+  }
+  const newcomers = members.filter((id) => !before.has(id));
+  if (!closed && newcomers.length) {
+    await channel.send(`👋 Welcome ${newcomers.map((id) => `<@${id}>`).join(' ')}!`);
+  }
 }
 
 // ---------- members & commitments ----------
@@ -410,6 +545,12 @@ async function handleLink(interaction) {
       await at.update(O.table, org.id, { [O.f.discordUserId]: [...ids, interaction.user.id].join(',') });
     }
     orgMsg = `You're linked to **${org.fields[O.f.organization] || 'your organization'}**. Use \`/roster\` to see which creators signed up for your campaigns.`;
+    const orgRec = await at.first(O.table, { formula: `RECORD_ID()=${at.q(org.id)}`, fields: [O.f.proposals] });
+    const orgProposals = orgRec?.fields[O.f.proposals] || [];
+    if (orgProposals.length) {
+      const props = await listByIds(C.table, orgProposals, Object.values(C.f));
+      for (const pr of props) if (pr.fields[C.f.longTerm] && pr.fields[C.f.status] === C.ACTIVE) await syncCampaignChannel(pr);
+    }
   }
   if (!member) return interaction.editReply(orgMsg);
 
