@@ -73,30 +73,74 @@ function fmtDate(d) {
   return new Date(Date.UTC(y, m - 1, day)).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
 }
 
+function progressBar(n, total, width = 10) {
+  if (!total || total <= 0) return '';
+  const filled = Math.max(0, Math.min(width, Math.round((n / total) * width)));
+  return '▰'.repeat(filled) + '▱'.repeat(width - filled);
+}
+
 function buildEmbed(fields, { closed = false } = {}) {
   const name = fields[C.f.shortName] || 'New campaign';
-  const details = fields[C.f.details] || '';
-  const e = new EmbedBuilder()
-    .setTitle(closed ? `[CLOSED] ${name}` : name)
-    .setDescription(details.length > 3900 ? details.slice(0, 3900) + '…' : details || '​')
-    .setColor(closed ? 0x808080 : 0x2ecc71);
-
-  const add = (label, value) => value && e.addFields({ name: label, value: String(value), inline: true });
-  add('Type', fields[C.f.proposalType]);
-  add('Creator pay', money(fields[C.f.creatorPay]));
-  add('Creators needed', fields[C.f.creatorsNeeded]);
+  const org = (fields[C.f.orgName] || []).filter(Boolean).join(', ');
+  const details = (fields[C.f.details] || '').trim();
+  const signups = Number(fields[C.f.signups]) || 0;
+  const needed = Number(fields[C.f.creatorsNeeded]) || 0;
+  const pay = Number(fields[C.f.creatorPay]) || 0;
   const start = fmtDate(fields[C.f.startDate]);
   const end = fmtDate(fields[C.f.endDate]);
-  add('Dates', start && end ? `${start} – ${end}` : start || end);
-  if (Array.isArray(fields[C.f.issues]) && fields[C.f.issues].length) {
-    e.addFields({ name: 'Issues', value: fields[C.f.issues].join(', ').slice(0, 1000) });
-  }
-  e.setFooter({
-    text: closed
-      ? 'This campaign is closed. Sign-ups are no longer being taken.'
-      : `React ${SIGNUP_EMOJI} to sign up · remove your reaction to withdraw · /mycampaigns to see yours`,
+  const issues = Array.isArray(fields[C.f.issues]) ? fields[C.f.issues] : [];
+
+  const e = new EmbedBuilder()
+    .setAuthor({ name: closed ? '⚪  CAMPAIGN CLOSED' : '🟢  OPEN CAMPAIGN' })
+    .setTitle(name.slice(0, 256))
+    .setColor(closed ? 0x4f545c : 0x2ecc71);
+
+  const desc = [];
+  if (org) desc.push(`with **${org}**`);
+  if (details) desc.push(`\n${details.length > 3500 ? details.slice(0, 3500) + '…' : details}`);
+  e.setDescription(desc.join('\n') || '​');
+
+  e.addFields(
+    { name: '💰 Pay', value: pay ? `${money(pay)}` : 'Unpaid / TBD', inline: true },
+    {
+      name: '👥 Spots',
+      value: needed ? `${signups} of ${needed} filled\n${progressBar(signups, needed)}` : `${signups} signed up`,
+      inline: true,
+    },
+    { name: '📅 Dates', value: start && end ? `${start} –\n${end}` : start || end || 'Flexible', inline: true }
+  );
+  const tags = [fields[C.f.proposalType], ...issues].filter(Boolean);
+  if (tags.length) e.addFields({ name: '🏷️ Focus', value: tags.map((t) => `\`${t}\``).join('  ').slice(0, 1000) });
+
+  e.addFields({
+    name: '​',
+    value: closed
+      ? '**Sign-ups are closed.** Thanks to everyone who joined!'
+      : `**React ${SIGNUP_EMOJI} below to sign up.** Remove your reaction to withdraw.\nType \`/mycampaigns\` to see everything you've joined.`,
   });
+  e.setFooter({ text: 'Creator Congress' });
   return e;
+}
+
+// Re-render a post (e.g. to update the sign-up count) — debounced so a burst of reactions = one edit.
+const refreshTimers = new Map();
+function scheduleRefresh(messageId, campaignId) {
+  clearTimeout(refreshTimers.get(messageId));
+  refreshTimers.set(
+    messageId,
+    setTimeout(async () => {
+      refreshTimers.delete(messageId);
+      try {
+        const [rec] = await at.list(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: Object.values(C.f) });
+        if (!rec) return;
+        const channel = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
+        const msg = await channel.messages.fetch(messageId);
+        await msg.edit({ embeds: [buildEmbed(rec.fields, { closed: rec.fields[C.f.status] !== C.ACTIVE })] });
+      } catch (err) {
+        log(`Could not refresh post ${messageId}: ${err.message}`);
+      }
+    }, 4000)
+  );
 }
 
 async function syncCampaignPosts() {
@@ -188,6 +232,7 @@ async function commit(user, messageId, campaign) {
     await at.create(K.table, fields);
   }
   log(`Committed: ${user.username} (${user.id}) → ${campaign.name}`);
+  scheduleRefresh(messageId, campaign.id);
   return { member, changed: true };
 }
 
@@ -196,6 +241,7 @@ async function withdraw(user, messageId, campaign) {
   if (!existing || existing.fields[K.f.status] === 'Withdrawn') return false;
   await at.update(K.table, existing.id, { [K.f.status]: 'Withdrawn', [K.f.withdrawnAt]: now() });
   log(`Withdrawn: ${user.username} (${user.id}) ✗ ${campaign.name}`);
+  scheduleRefresh(messageId, campaign.id);
   return true;
 }
 
@@ -299,6 +345,7 @@ async function reconcileOpenCampaigns() {
         log(`Reconcile: withdrew ${uid} from ${campaign.name}`);
       }
     }
+    scheduleRefresh(messageId, campaign.id); // also upgrades older posts to the current design
   }
 }
 
@@ -386,7 +433,7 @@ async function handleLink(interaction) {
 async function handleMyCampaigns(interaction) {
   const rows = await at.list(K.table, {
     formula: `AND({${K.names.discordUserId}}=${at.q(interaction.user.id)}, {${K.names.status}}="Committed")`,
-    fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay],
+    fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay, K.f.orgName],
   });
   if (!rows.length) {
     return interaction.editReply(`You haven't signed up for any campaigns yet. React ${SIGNUP_EMOJI} on a post in <#${CAMPAIGN_CHANNEL_ID}> to join one.`);
@@ -396,35 +443,53 @@ async function handleMyCampaigns(interaction) {
     const n = Number(first(r.fields[K.f.campaignPay]));
     return Number.isFinite(n) && n > 0 ? n : 0;
   };
-  const line = (r) => {
+  const entry = (r, isActive) => {
     const name = first(r.fields[K.f.campaignName]) || 'Campaign';
+    const org = first(r.fields[K.f.orgName]);
     const end = fmtDate(first(r.fields[K.f.campaignEndDate]));
     const link = `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${r.fields[K.f.discordMessageId]}`;
-    return `• [${name}](${link})${pay(r) ? ` · ${money(pay(r))}` : ''}${end ? ` · ends ${end}` : ''}`;
+    const details = [pay(r) ? money(pay(r)) : null, org, end ? `${isActive ? 'ends' : 'ended'} ${end}` : null].filter(Boolean);
+    return `**[${name}](${link})**${details.length ? `\n╰ ${details.join(' · ')}` : ''}`;
   };
   const active = rows.filter((r) => first(r.fields[K.f.campaignStatus]) === C.ACTIVE);
   const past = rows.filter((r) => first(r.fields[K.f.campaignStatus]) !== C.ACTIVE);
   const sum = (list) => list.reduce((t, r) => t + pay(r), 0);
+  const fit = (list, isActive) => {
+    let out = '';
+    for (const r of list) {
+      const next = (out ? '\n\n' : '') + entry(r, isActive);
+      if (out.length + next.length > 1000) return out + `\n\n…and ${list.length - out.split('\n\n').length} more`;
+      out += next;
+    }
+    return out;
+  };
 
-  const e = new EmbedBuilder().setTitle('Your campaigns').setColor(0x2ecc71);
-  if (active.length) e.addFields({ name: `Active (${active.length})`, value: active.map(line).join('\n').slice(0, 1024) });
-  if (past.length) e.addFields({ name: `Past (${past.length})`, value: past.map(line).join('\n').slice(0, 1024) });
+  const summary = [
+    sum(rows) ? `💰 **${money(sum(rows))}** expected` : null,
+    `🟢 **${active.length}** active`,
+    `⚪ **${past.length}** past`,
+  ].filter(Boolean);
+  const e = new EmbedBuilder()
+    .setAuthor({ name: 'CREATOR CONGRESS' })
+    .setTitle('📋 Your campaigns')
+    .setColor(0x2ecc71)
+    .setDescription(summary.join('   ·   '));
+  if (active.length) e.addFields({ name: '━━━━  ACTIVE  ━━━━', value: fit(active, true) });
+  if (past.length) e.addFields({ name: '━━━━  PAST  ━━━━', value: fit(past, false) });
   if (sum(rows) > 0) {
     e.addFields({
-      name: '💰 Expected pay',
+      name: '━━━━  EXPECTED PAY  ━━━━',
       value:
-        `**${money(sum(rows))}** across all your campaigns\n` +
-        [sum(active) && `${money(sum(active))} from active campaigns`, sum(past) && `${money(sum(past))} from past campaigns`]
-          .filter(Boolean)
-          .join(' · ') +
-        '\n_Estimate based on each campaign’s creator rate, not confirmed payments._',
+        `**${money(sum(rows))}** across all your campaigns` +
+        (sum(active) && sum(past) ? `\n${money(sum(active))} active · ${money(sum(past))} past` : '') +
+        '\n_Estimate based on campaign rates, not confirmed payments._',
     });
   }
   const unlinked = rows.some((r) => !r.fields[K.f.creator]?.length);
   const notes = [];
   if (unlinked) notes.push('Run /link with your application email to connect these to your profile.');
   if (PORTAL_URL) notes.push(`Also on your member portal: ${PORTAL_URL}`);
-  if (notes.length) e.setFooter({ text: notes.join(' · ') });
+  e.setFooter({ text: notes.length ? notes.join(' · ') : 'Only you can see this.' });
   return interaction.editReply({ embeds: [e] });
 }
 
@@ -448,7 +513,7 @@ async function handleRoster(interaction) {
   if (!proposalIds.length) {
     return interaction.editReply("Your organization doesn't have any campaigns connected yet. Message a Creator Congress team member if that looks wrong.");
   }
-  const proposals = await listByIds(C.table, proposalIds, [C.f.shortName, C.f.status, C.f.discordMessageId, C.f.creatorsNeeded]);
+  const proposals = await listByIds(C.table, proposalIds, [C.f.shortName, C.f.status, C.f.discordMessageId, C.f.creatorsNeeded, C.f.creatorPay, C.f.endDate]);
   const messageIds = proposals.map((p) => p.fields[C.f.discordMessageId]).filter(Boolean);
 
   const signups = new Map(); // messageId -> rows
@@ -470,34 +535,48 @@ async function handleRoster(interaction) {
   proposals.sort((a, b) => (b.fields[C.f.status] === C.ACTIVE) - (a.fields[C.f.status] === C.ACTIVE) || count(b) - count(a));
 
   const orgName = orgs.map((o) => o.fields[O.f.organization]).filter(Boolean).join(', ') || 'Your organization';
-  const e = new EmbedBuilder().setTitle(`${orgName}: campaign sign-ups`).setColor(0x5865f2);
+  const activeCount = proposals.filter((p) => p.fields[C.f.status] === C.ACTIVE).length;
+  const totalCreators = new Set([...signups.values()].flat().map((r) => r.fields[K.f.discordUserId])).size;
+  const e = new EmbedBuilder()
+    .setAuthor({ name: 'CREATOR CONGRESS · PARTNER VIEW' })
+    .setTitle(`📊 ${orgName}`.slice(0, 256))
+    .setColor(0x5865f2)
+    .setDescription(`🟢 **${activeCount}** active campaign${activeCount === 1 ? '' : 's'}   ·   👥 **${totalCreators}** creator${totalCreators === 1 ? '' : 's'} signed up`);
   // Discord embeds allow 25 fields and ~6000 characters in total.
-  let budget = 5400 - e.data.title.length;
+  let budget = 5300 - e.data.title.length - e.data.description.length;
   const shown = [];
   for (const p of proposals.slice(0, 24)) {
     const name = p.fields[C.f.shortName] || 'Campaign';
     const active = p.fields[C.f.status] === C.ACTIVE;
-    const needed = p.fields[C.f.creatorsNeeded];
+    const needed = Number(p.fields[C.f.creatorsNeeded]) || 0;
     const rows = signups.get(p.fields[C.f.discordMessageId]) || [];
-    let value;
-    if (!p.fields[C.f.discordMessageId]) value = '_Not posted to Discord yet_';
-    else if (!rows.length) value = '_No sign-ups yet_';
+    const meta = [
+      needed ? `${progressBar(rows.length, needed)}  **${rows.length}/${needed}** filled` : `**${rows.length}** signed up`,
+      p.fields[C.f.creatorPay] ? `${money(p.fields[C.f.creatorPay])} per creator` : null,
+      p.fields[C.f.endDate] ? `${active ? 'ends' : 'ended'} ${fmtDate(p.fields[C.f.endDate])}` : null,
+    ].filter(Boolean);
+    let list;
+    if (!p.fields[C.f.discordMessageId]) list = '_Not posted to Discord yet_';
+    else if (!rows.length) list = '_No sign-ups yet_';
     else {
-      value = rows
+      list = rows
         .map((r) => {
           const nm = (r.fields[K.f.creatorName] || [])[0] || r.fields[K.f.discordUsername] || 'Creator';
-          return `• ${nm} (<@${r.fields[K.f.discordUserId]}>)`;
+          return `› ${nm} · <@${r.fields[K.f.discordUserId]}>`;
         })
         .join('\n');
-      if (value.length > 1000) value = value.slice(0, value.lastIndexOf('\n', 990)) + '\n…and more (see Airtable)';
+      if (list.length > 800) list = list.slice(0, list.lastIndexOf('\n', 790)) + '\n› …and more (see Airtable)';
     }
-    const fieldName = `${active ? '🟢' : '⚪'} ${name} · ${rows.length}${needed ? `/${needed}` : ''} creators`.slice(0, 256);
+    const value = `${meta.join(' · ')}\n${list}`.slice(0, 1024);
+    const fieldName = `${active ? '🟢' : '⚪'}  ${name}`.slice(0, 256);
     if (fieldName.length + value.length > budget) break;
     budget -= fieldName.length + value.length;
     e.addFields({ name: fieldName, value });
     shown.push(p);
   }
-  if (proposals.length > shown.length) e.setFooter({ text: `Showing ${shown.length} of ${proposals.length} campaigns.` });
+  e.setFooter({
+    text: (proposals.length > shown.length ? `Showing ${shown.length} of ${proposals.length} campaigns · ` : '') + 'Only you can see this.',
+  });
   return interaction.editReply({ embeds: [e] });
 }
 
