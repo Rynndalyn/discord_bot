@@ -25,12 +25,25 @@ export const CAMPAIGNS = {
     longTerm: 'fldL7qqJUFjgp5gAH',
     channelId: 'fldRuMzDfu1fO6spl',
     requiresApproval: 'fldjsGGtNy9QDCiAI',
+    joinMode: 'fldj4Agzff6U2T7t6', // Open / Partner-reviewed / Invite-only
+    invited: 'fldR5TjuJfJ15J6a6',
+    suggested: 'fldeITRzkBDdvvNzP',
+    suggestionNotes: 'fldqiVNe9jMkbOzbF',
+    refreshSuggestions: 'fldYp866Key1HOwmD',
+    locationPref: 'fldcxAJkmCGWR7tix',
+    reachNeeded: 'fldwUCSYpCmChInvI',
+    inviteOnlyBox: 'fldqRnkOpltFTHkds', // older form checkbox, folded into joinMode
   },
   names: {
     status: 'Active / Inactive',
     longTerm: 'Long-term (Discord channel)',
     channelId: 'Discord Channel ID',
     requiresApproval: 'Requires approval',
+    joinMode: 'How creators join',
+    invited: 'Invited Creators',
+    suggestionNotes: 'Suggestion Notes',
+    refreshSuggestions: 'Refresh Suggestions',
+    inviteOnlyBox: 'Invite Only Campaign',
     postToDiscord: 'Post to Discord',
     discordMessageId: 'Discord Message ID',
     discordClosed: 'Discord Closed',
@@ -52,11 +65,18 @@ export const MEMBERS = {
     youtube: 'fldz9lG5J35dYGX33',
     issues: 'fldAQ4Rxwwny9IDf2',
     about: 'fldp9yA5ayeaonZyT',
+    state: 'fld75P7zQGJrsBrBp',
+    signedCoc: 'fldeLthdDawnr5frP',
+    portalToken: 'fldH8LniupnWfBDo3',
+    pageLink: 'fldDgmYdtawTgb0ek',
+    campaignEmails: 'flda1GHTQZ47rMwd5', // Auto / Always email / Never email
+    commitments: 'fldmyM8OqSkkP8Mfk', // inverse link to Campaign Commitments
   },
   names: {
     email: 'Email',
     approved: 'Approved',
     discordUserId: 'Discord User ID',
+    portalToken: 'Portal Token',
   },
 };
 
@@ -100,6 +120,9 @@ export const COMMITMENTS = {
     reviewedAt: 'fldgmZEpDUpjNDHy0',
     reminderSent: 'fldQ1oQ6eGZjXSYYV',
     flagged: 'fldjf1OpU6fpOWpRg',
+    joinedVia: 'fldYN33zkqmzpSiie', // Discord / Web page / Invitation / Portal
+    requestedAction: 'fldcvzqb1KkrUaKCx', // set from the portal: Leave / Accept invitation / Decline invitation
+    actionResult: 'fldjLKcxOd3SKxpZH',
   },
   names: {
     status: 'Status',
@@ -109,5 +132,35 @@ export const COMMITMENTS = {
     requestedAt: 'Requested At',
     reminderSent: 'Reminder Sent',
     flagged: 'Flagged to Staff',
+    joinedVia: 'Joined Via',
+    requestedAction: 'Requested Action',
   },
+};
+
+export const OUTBOX = {
+  table: 'tblvDJvK9vejsJupy', // Email Outbox (an Airtable automation sends each new row)
+  f: {
+    subject: 'fldfFbYd8ODZFdWkV',
+    to: 'fldfymY5VvzC2tmL5',
+    body: 'fldtnrOBtgnO25ssS',
+    kind: 'fld0rOoTfTTAjq0Ay',
+    creator: 'fldf4z21TBmIfjnMW',
+    sent: 'fldV4FzMdVEnnXl2O',
+  },
+  names: { kind: 'Kind' },
+};
+
+export const PORTAL = {
+  table: 'tbld1DRLGc5LTG5Ga', // Portal Requests (one row per portal button click)
+  f: {
+    summary: 'fldOewg3w3zErGxNM',
+    email: 'flddFQclp3P6rZTmd',
+    campaign: 'fld5vqFL9saw0VyYg',
+    action: 'fldkbniJaDrdqLtEU',
+    status: 'flduHdv3Aa4OewUl0',
+    result: 'fldUYMMlbjtgPJ8ZG',
+    processedAt: 'fld8G9eDMZlTy42Pi',
+    creator: 'fldhu6t4gvKMHjNso',
+  },
+  names: { status: 'Status', action: 'Action' },
 };
