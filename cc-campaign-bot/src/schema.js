@@ -46,6 +46,7 @@ export const CAMPAIGNS = {
   names: {
     status: 'Active / Inactive',
     longTerm: 'Long-term (Discord channel)',
+    orgLinks: 'Organization Applications',
     oldChannelId: 'Old Discord Channel ID',
     threadId: 'Discord Thread ID',
     requiresApproval: 'Requires approval',
