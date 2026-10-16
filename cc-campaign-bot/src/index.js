@@ -358,9 +358,38 @@ async function syncOrgLobby(guild, org, ch, camps) {
   return orgIds;
 }
 
+// The bot's role needs these server-wide to make org channels and private threads.
+const NEEDED_PERMS = ['ViewChannel', 'SendMessages', 'SendMessagesInThreads', 'ReadMessageHistory', 'EmbedLinks', 'AttachFiles', 'AddReactions',
+  'ManageChannels', 'ManageRoles', 'ManageThreads', 'CreatePrivateThreads', 'ManageMessages'];
+let lastPermWarning = 0;
+async function missingBotPerms(guild) {
+  let me = null;
+  try {
+    me = guild.members.me || (await guild.members.fetchMe());
+  } catch {
+    return [];
+  }
+  if (!me?.permissions) return [];
+  if (me.permissions.has(PermissionFlagsBits.Administrator)) return [];
+  return NEEDED_PERMS.filter((p) => !me.permissions.has(PermissionFlagsBits[p]));
+}
+
 async function doSyncCampaignThread(rec) {
   const f = rec.fields;
   if (!f[C.f.discordMessageId]) return;
+  {
+    const g = await client.guilds.fetch(DISCORD_GUILD_ID);
+    const missing = await missingBotPerms(g);
+    if (missing.length) {
+      if (Date.now() - lastPermWarning > 30 * 60_000) {
+        lastPermWarning = Date.now();
+        log(`CAN'T MAKE ORG CHANNELS/THREADS: the bot's role is missing these permissions: ${missing.join(', ')}. ` +
+          'Fix: Discord → Server Settings → Roles → the bot\'s role → turn them on (or re-open the invite link with the new permissions). ' +
+          'Also drag the bot\'s role above your staff role.');
+      }
+      return;
+    }
+  }
   const orgId = first1(f[C.f.orgLinks]);
   if (!orgId) return log(`Campaign ${rec.id} has no organization linked, so there's no org channel to put its thread in.`);
   const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
