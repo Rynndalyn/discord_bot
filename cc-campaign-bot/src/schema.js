@@ -23,7 +23,8 @@ export const CAMPAIGNS = {
     orgName: 'fldZXf8wiFZ8tMrxV',
     orgLinks: 'fldKj2zkQwqTzh6Y8',
     longTerm: 'fldL7qqJUFjgp5gAH',
-    channelId: 'fldRuMzDfu1fO6spl',
+    oldChannelId: 'fldRuMzDfu1fO6spl', // legacy per-campaign channel (moved to a thread, then cleared)
+    threadId: 'fldaUMdWrrIE1dVf7', // private thread inside the org's channel
     requiresApproval: 'fldjsGGtNy9QDCiAI',
     joinMode: 'fldj4Agzff6U2T7t6', // Open / Partner-reviewed / Invite-only
     invited: 'fldR5TjuJfJ15J6a6',
@@ -33,11 +34,20 @@ export const CAMPAIGNS = {
     locationPref: 'fldcxAJkmCGWR7tix',
     reachNeeded: 'fldwUCSYpCmChInvI',
     inviteOnlyBox: 'fldqRnkOpltFTHkds', // older form checkbox, folded into joinMode
+    // Who confirmed creators contact about the work and payment (the org lead handles both).
+    leadName: 'fldfAyGax4m8kqMak', // Lead Contact Name (optional override)
+    leadEmail: 'fld9dMBLtjAsGOPpe', // Lead Contact Email (optional override)
+    orgFirst: 'fld2VWswI6JsArDBY', // lookup: org application First Name
+    orgLast: 'fldQ8xQmZzVTpZPIt', // lookup: org application Last Name
+    orgEmail: 'fldEJo13p4tt7uCjd', // lookup: org application Email
+    paymentDetails: 'fldVlbz2T64q54LJj', // Payment Details (rich text / markdown)
+    commitments: 'fldANy5riz4mePn4U', // inverse link to Campaign Commitments
   },
   names: {
     status: 'Active / Inactive',
     longTerm: 'Long-term (Discord channel)',
-    channelId: 'Discord Channel ID',
+    oldChannelId: 'Old Discord Channel ID',
+    threadId: 'Discord Thread ID',
     requiresApproval: 'Requires approval',
     joinMode: 'How creators join',
     invited: 'Invited Creators',
@@ -89,8 +99,13 @@ export const ORGS = {
     approved: 'fldM7s2R2XJV8FKdq',
     proposals: 'fldu8NrBaV7t5hrva',
     discordUserId: 'fldm5KUnv3SWbucA0', // comma-separated: several staff can link to one org
+    lastName: 'fldj1PIcBZtbvccQh',
+    pageToken: 'fldujPwBcBiHvySCs', // Org Page Token (secret in the partner page link)
+    pageLink: 'fldTRnBsQsMYak3qO', // Partner Page Link
+    channelId: 'fldHPWHSthUi3m7ro', // the org's private Discord channel (lobby)
   },
   names: {
+    pageToken: 'Org Page Token',
     email: 'Email',
     approved: 'Approved',
     discordUserId: 'Discord User ID',
@@ -123,6 +138,21 @@ export const COMMITMENTS = {
     joinedVia: 'fldYN33zkqmzpSiie', // Discord / Web page / Invitation / Portal
     requestedAction: 'fldcvzqb1KkrUaKCx', // set from the portal: Leave / Accept invitation / Decline invitation
     actionResult: 'fldjLKcxOd3SKxpZH',
+    leadContact: 'fld6Ij3WqYmvIwFpp', // lookup: campaign's Creator Contact ("Name · email")
+    paymentDetails: 'fldS54oAhRrtd4beV', // lookup: campaign's Payment Details
+    creatorEmail: 'fld6GJOZts104gOQ0', // lookup
+    // Payments: the org marks paid, the creator confirms. "Paid" only once the creator confirms (or 14 days of silence).
+    paymentStatus: 'fldxD2uSw55HtMEKo', // Not due yet / Payment due / Org says paid / Paid / Issue
+    amountPaid: 'fldGvQQw4udJqO9Pl',
+    orgPaidAt: 'fldWKHm7MX4nyyrzK',
+    orgPaidBy: 'fldV9Mm5U75Ldpwrt',
+    paymentNote: 'fldeucGv0GD85kURU',
+    creatorAskedAt: 'fldzpxXQzMvD8Mvkz',
+    paidConfirmedAt: 'fldM4lxivN7lMeqcx',
+    paidConfirmedBy: 'fldm5FJYmv40YWOct', // Creator / Auto (14 days) / Staff
+    paymentReminders: 'fldiZyTYZceF3Fm9X',
+    paymentFlagged: 'fldmMndetPEcaWf2U',
+    paymentDueDate: 'fldFrtYERMKtPySiN', // formula: End Date + 30 days
   },
   names: {
     status: 'Status',
@@ -134,6 +164,7 @@ export const COMMITMENTS = {
     flagged: 'Flagged to Staff',
     joinedVia: 'Joined Via',
     requestedAction: 'Requested Action',
+    paymentStatus: 'Payment Status',
   },
 };
 
