@@ -150,8 +150,8 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
   if (modeOf(fields) === 'review' && !closed) {
     e.addFields({ name: '🙋 Partner-reviewed', value: `${org || 'The partner'} reviews each sign-up. React to request a spot, and you'll get a DM once you're confirmed.` });
   }
-  if (fields[C.f.longTerm] && !closed) {
-    e.addFields({ name: '🔒 Long-term campaign', value: 'Once you’re confirmed, you’re added to a private thread for this campaign in the partner’s Discord channel.' });
+  if (hasThread(fields) && !closed) {
+    e.addFields({ name: '💬 Campaign thread', value: 'Once you’re confirmed, you’re added to a private thread for this campaign in the partner’s Discord channel.' });
   }
 
   e.addFields({
@@ -182,7 +182,7 @@ function scheduleRefresh(messageId, campaignId) {
           const msg = await channel.messages.fetch(messageId);
           await msg.edit({ embeds: [buildEmbed(rec.fields, { closed: rec.fields[C.f.status] !== C.ACTIVE })] });
         }
-        if (rec.fields[C.f.longTerm]) await syncCampaignChannel(rec);
+        if (hasThread(rec.fields)) await syncCampaignChannel(rec);
       } catch (err) {
         log(`Could not refresh post ${messageId}: ${err.message}`);
       }
@@ -205,12 +205,12 @@ async function syncCampaignPosts() {
     await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false });
     campaignByMessage.set(msg.id, campaignInfo(rec));
     log(`Posted campaign ${rec.id} as message ${msg.id}`);
-    if (rec.fields[C.f.longTerm]) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
+    if (hasThread(rec.fields)) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
   }
 
-  // 1b) Long-term box checked after the campaign was already posted (or an old channel to move over) → create its thread
+  // 1b) Posted campaigns with an org linked but no thread yet (or an old channel to move over) → create its thread
   const needChannel = await at.list(C.table, {
-    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.longTerm}}, {${C.names.discordMessageId}}!="", OR({${C.names.threadId}}="", {${C.names.oldChannelId}}!=""))`,
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.orgLinks}}!="", {${C.names.discordMessageId}}!="", OR({${C.names.threadId}}="", {${C.names.oldChannelId}}!=""))`,
     fields: campaignFields,
   });
   for (const rec of needChannel) await syncCampaignChannel(rec);
@@ -247,14 +247,17 @@ async function editPost(channel, rec, closed) {
   await at.update(C.table, rec.id, { [C.f.discordClosed]: closed });
   campaignByMessage.set(messageId, { ...campaignInfo(rec), closed });
   log(`${closed ? 'Closed' : 'Re-opened'} campaign ${rec.id}`);
-  if (rec.fields[C.f.longTerm]) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.status]: closed ? 'closed' : C.ACTIVE } });
+  if (hasThread(rec.fields)) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.status]: closed ? 'closed' : C.ACTIVE } });
 }
 
-// ---------- long-term campaigns: one private channel per partner org (the lobby), a private thread per campaign ----------
-// Lobby: the org's linked contacts + staff + every creator confirmed on one of the org's long-term campaigns.
+// ---------- campaign spaces: one private channel per partner org (the lobby), a private thread per campaign ----------
+// Lobby: the org's linked contacts + staff + every creator confirmed on one of the org's campaigns.
 // Thread: only that campaign's confirmed creators + the org's contacts (staff see every thread via Manage Threads).
 // Closed campaign → its thread is locked (read-only). Withdraw → removed from the thread (and from the lobby if it was
 // their last campaign with that org). Old one-channel-per-campaign channels are moved over automatically.
+
+// Every campaign with a partner org linked gets a private thread in that org's channel.
+const hasThread = (f) => (f?.[C.f.orgLinks] || []).length > 0;
 
 const slug = (name) =>
   String(name || 'campaign').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || 'campaign';
@@ -306,7 +309,7 @@ async function ensureOrgChannel(guild, org) {
     name: slug(orgName),
     type: ChannelType.GuildText,
     parent: parent.id,
-    topic: `Private space for ${orgName} and the creators working with them. Each long-term campaign has its own thread.`.slice(0, 1024),
+    topic: `Private space for ${orgName} and the creators working with them. Each campaign has its own thread.`.slice(0, 1024),
     permissionOverwrites: [
       { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
       { id: client.user.id, allow: BOT_PERMS },
@@ -322,7 +325,7 @@ async function ensureOrgChannel(guild, org) {
         .setDescription(
           `This is the private lobby for **${orgName}** and the creators working with them.\n\n` +
             '• **Lobby (here):** announcements and anything that applies to all of their campaigns. Everyone working with this partner can read it.\n' +
-            '• **Campaign threads:** each long-term campaign has a private thread below. You only see the threads for campaigns you’re confirmed on.\n\n' +
+            '• **Campaign threads:** each campaign has a private thread below. You only see the threads for campaigns you’re confirmed on.\n\n' +
             'People are added and removed automatically as they join or leave campaigns. When a campaign ends, its thread becomes read-only.'
         ),
     ],
@@ -357,9 +360,9 @@ async function syncOrgLobby(guild, org, ch, camps) {
 
 async function doSyncCampaignThread(rec) {
   const f = rec.fields;
-  if (!f[C.f.longTerm] || !f[C.f.discordMessageId]) return;
+  if (!f[C.f.discordMessageId]) return;
   const orgId = first1(f[C.f.orgLinks]);
-  if (!orgId) return log(`Long-term campaign ${rec.id} has no organization linked, so there's no org channel to put its thread in.`);
+  if (!orgId) return log(`Campaign ${rec.id} has no organization linked, so there's no org channel to put its thread in.`);
   const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
   const closed = f[C.f.status] !== C.ACTIVE;
   const name = f[C.f.shortName] || 'Campaign';
@@ -373,8 +376,8 @@ async function doSyncCampaignThread(rec) {
 
   const ch = await ensureOrgChannel(guild, org);
   const camps = (org.fields[O.f.proposals] || []).length
-    ? (await listByIds(C.table, org.fields[O.f.proposals], [C.f.status, C.f.longTerm, C.f.discordMessageId, C.f.threadId])).filter(
-        (p) => p.fields[C.f.longTerm] && p.fields[C.f.discordMessageId] && (p.fields[C.f.threadId] || p.id === rec.id)
+    ? (await listByIds(C.table, org.fields[O.f.proposals], [C.f.status, C.f.discordMessageId, C.f.threadId])).filter(
+        (p) => p.fields[C.f.discordMessageId] && (p.fields[C.f.threadId] || p.id === rec.id)
       )
     : [];
   if (!camps.some((p) => p.id === rec.id)) camps.push({ id: rec.id, fields: f });
@@ -388,7 +391,7 @@ async function doSyncCampaignThread(rec) {
       type: ChannelType.PrivateThread,
       invitable: false,
       autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
-      reason: `Long-term campaign ${rec.id}`,
+      reason: `Campaign ${rec.id}`,
     });
     await at.update(C.table, rec.id, { [C.f.threadId]: thread.id });
     log(`Created thread "${thread.name}" in #${ch.name} for ${rec.id}`);
@@ -435,7 +438,7 @@ async function doSyncCampaignThread(rec) {
           .setTitle(`👋 Welcome to ${name}`.slice(0, 256))
           .setColor(0x2ecc71)
           .setDescription(
-            `This is the private thread for this long-term campaign.${isInviteKey(f[C.f.discordMessageId]) ? '' : ` [See the campaign post](${postLink}).`}\n\n` +
+            `This is the private thread for this campaign.${isInviteKey(f[C.f.discordMessageId]) ? '' : ` [See the campaign post](${postLink}).`}\n\n` +
               'Confirmed creators are added automatically, along with the partner organization. The Creator Congress team can see it too. ' +
               'Leaving the campaign removes you from this thread.'
           ),
@@ -468,13 +471,13 @@ async function doSyncCampaignThread(rec) {
   }
 }
 
-// Every 30 minutes: re-check active long-term threads (reopens threads Discord auto-archived, fixes any drift).
+// Every 30 minutes: re-check active campaign threads (reopens threads Discord auto-archived, fixes any drift).
 let lastThreadSweep = 0;
 async function sweepCampaignThreads() {
   if (Date.now() - lastThreadSweep < 30 * 60_000) return;
   lastThreadSweep = Date.now();
   const recs = await at.list(C.table, {
-    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.longTerm}}, {${C.names.threadId}}!="")`,
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.threadId}}!="")`,
     fields: Object.values(C.f),
   });
   for (const rec of recs) await syncCampaignChannel(rec);
@@ -1056,7 +1059,7 @@ async function handleInviteButton(interaction) {
   if (!row) return interaction.reply({ content: 'This invitation no longer exists.', flags: MessageFlags.Ephemeral });
   if (row.fields[K.f.discordUserId] !== interaction.user.id) return interaction.reply({ content: 'This invitation is for someone else.', flags: MessageFlags.Ephemeral });
   const campaignId = (row.fields[K.f.campaign] || [])[0];
-  const camp = await at.first(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: [C.f.shortName, C.f.status, C.f.longTerm] });
+  const camp = await at.first(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: [C.f.shortName, C.f.status, C.f.orgLinks] });
   const name = camp?.fields[C.f.shortName] || 'the campaign';
   if (row.fields[K.f.status] !== 'Invited') {
     await interaction.update({ components: [] }).catch(() => {});
@@ -1085,7 +1088,7 @@ async function handleInviteButton(interaction) {
     .setColor(accept ? 0x2ecc71 : 0x4f545c)
     .setFooter({
       text: accept
-        ? `Confirmed! We've DMed you your contact and payment details.${camp?.fields[C.f.longTerm] ? ' You’ll be added to the campaign’s private thread in a moment.' : ''}`
+        ? `Confirmed! We've DMed you your contact and payment details.${hasThread(camp?.fields) ? ' You’ll be added to the campaign’s private thread in a moment.' : ''}`
         : 'Thanks for letting us know. This won’t affect future invitations.',
     });
   return interaction.update({ embeds: [base], components: [] });
@@ -1359,7 +1362,7 @@ function contactHtml(f) {
 async function announceConfirmed({ campFields, creatorId, discordUserId, user, headline, extra = '' }) {
   if (!campFields) return;
   const name = campFields[C.f.shortName] || 'the campaign';
-  const channelNote = campFields[C.f.longTerm] ? ' You’ll be added to the campaign’s private thread in the partner’s channel in a moment.' : '';
+  const channelNote = hasThread(campFields) ? ' You’ll be added to the campaign’s private thread in the partner’s channel in a moment.' : '';
   const target = user || (isSnowflake(discordUserId) ? await client.users.fetch(discordUserId).catch(() => null) : null);
   if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}\n\n${contactMd(campFields)}${extra}`);
   if (creatorId) {
@@ -1393,7 +1396,7 @@ async function emailInvite(creator, campaignFields, { reminder = false } = {}) {
 async function emailDecision(creator, campFields, approved) {
   const cf = creator.fields;
   const campaignName = campFields[C.f.shortName] || 'the campaign';
-  const longTerm = !!campFields[C.f.longTerm];
+  const longTerm = hasThread(campFields);
   return queueEmail({
     creator,
     kind: approved ? 'Confirmed' : 'Not selected',
@@ -1562,7 +1565,7 @@ async function respondToInvite(rowId, accept) {
   const row = await at.first(K.table, { formula: `RECORD_ID()=${at.q(rowId)}`, fields: [K.f.status, K.f.campaign, K.f.discordMessageId, K.f.creator, K.f.discordUserId] });
   if (!row) return { result: 'missing' };
   const campaignId = first1(row.fields[K.f.campaign]);
-  const camp = await at.first(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: [C.f.shortName, C.f.status, C.f.longTerm] });
+  const camp = await at.first(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: [C.f.shortName, C.f.status, C.f.orgLinks] });
   if (row.fields[K.f.status] !== 'Invited') return { result: 'answered', row, camp };
   if (camp?.fields[C.f.status] !== C.ACTIVE) return { result: 'closed', row, camp };
   await at.update(K.table, row.id, {
@@ -1667,7 +1670,7 @@ function campaignCard(p, { mineRow, inviteRow, token }) {
   ${mode === 'review' && !inviteRow ? `<div class="note">🙋 Partner-reviewed: ${esc(org || 'the partner')} approves each creator. You'll be emailed when you're confirmed.</div>` : ''}
   ${inviteRow ? `<div class="note violet">✉️ You were personally invited to this campaign.</div>` : ''}
   ${status === 'Committed' ? paymentHtml(mineRow, token) + contactHtml(f) : ''}
-  ${f[C.f.longTerm] ? `<div class="note violet">🔒 Long-term: this campaign coordinates in a private Discord thread with the partner. Not on Discord? The team will keep you posted by email.</div>` : ''}
+  ${hasThread(f) ? `<div class="note violet">💬 Confirmed creators join a private Discord thread with the partner. Not on Discord? The team will keep you posted by email.</div>` : ''}
   <div class="actions">${actions}</div>
 </div>`;
 }
@@ -2539,7 +2542,7 @@ async function handleLink(interaction) {
     const orgProposals = orgRec?.fields[O.f.proposals] || [];
     if (orgProposals.length) {
       const props = await listByIds(C.table, orgProposals, Object.values(C.f));
-      for (const pr of props) if (pr.fields[C.f.longTerm] && pr.fields[C.f.status] === C.ACTIVE) await syncCampaignChannel(pr);
+      for (const pr of props) if (hasThread(pr.fields) && pr.fields[C.f.status] === C.ACTIVE) await syncCampaignChannel(pr);
     }
   }
   if (!member) return interaction.editReply(orgMsg);
