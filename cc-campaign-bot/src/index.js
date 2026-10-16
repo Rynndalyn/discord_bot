@@ -18,6 +18,10 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ThreadAutoArchiveDuration,
 } from 'discord.js';
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -38,6 +42,7 @@ const {
   PUBLIC_URL = '',
   CAMPAIGN_CATEGORY = 'Active Campaigns',
   ARCHIVE_CATEGORY = 'Archived Campaigns',
+  ORG_CATEGORY = 'Partner Organizations',
 } = process.env;
 
 for (const [k, v] of Object.entries({ DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, CAMPAIGN_CHANNEL_ID, AIRTABLE_TOKEN: process.env.AIRTABLE_TOKEN })) {
@@ -146,7 +151,7 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
     e.addFields({ name: '🙋 Partner-reviewed', value: `${org || 'The partner'} reviews each sign-up. React to request a spot, and you'll get a DM once you're confirmed.` });
   }
   if (fields[C.f.longTerm] && !closed) {
-    e.addFields({ name: '🔒 Long-term campaign', value: 'Signing up adds you to a private channel for this campaign with the partner team.' });
+    e.addFields({ name: '🔒 Long-term campaign', value: 'Once you’re confirmed, you’re added to a private thread for this campaign in the partner’s Discord channel.' });
   }
 
   e.addFields({
@@ -203,9 +208,9 @@ async function syncCampaignPosts() {
     if (rec.fields[C.f.longTerm]) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
   }
 
-  // 1b) Long-term box checked after the campaign was already posted → create its channel
+  // 1b) Long-term box checked after the campaign was already posted (or an old channel to move over) → create its thread
   const needChannel = await at.list(C.table, {
-    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.longTerm}}, {${C.names.discordMessageId}}!="", {${C.names.channelId}}="")`,
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.longTerm}}, {${C.names.discordMessageId}}!="", OR({${C.names.threadId}}="", {${C.names.oldChannelId}}!=""))`,
     fields: campaignFields,
   });
   for (const rec of needChannel) await syncCampaignChannel(rec);
@@ -245,7 +250,11 @@ async function editPost(channel, rec, closed) {
   if (rec.fields[C.f.longTerm]) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.status]: closed ? 'closed' : C.ACTIVE } });
 }
 
-// ---------- long-term campaigns: private channel per campaign ----------
+// ---------- long-term campaigns: one private channel per partner org (the lobby), a private thread per campaign ----------
+// Lobby: the org's linked contacts + staff + every creator confirmed on one of the org's long-term campaigns.
+// Thread: only that campaign's confirmed creators + the org's contacts (staff see every thread via Manage Threads).
+// Closed campaign → its thread is locked (read-only). Withdraw → removed from the thread (and from the lobby if it was
+// their last campaign with that org). Old one-channel-per-campaign channels are moved over automatically.
 
 const slug = (name) =>
   String(name || 'campaign').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 90) || 'campaign';
@@ -265,101 +274,210 @@ async function ensureCategory(guild, name) {
 }
 
 const VIEW = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory];
-const POST = [PermissionFlagsBits.SendMessages, PermissionFlagsBits.AddReactions, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks];
+const POST = [PermissionFlagsBits.SendMessages, PermissionFlagsBits.SendMessagesInThreads, PermissionFlagsBits.AddReactions, PermissionFlagsBits.AttachFiles, PermissionFlagsBits.EmbedLinks];
+const BOT_PERMS = [...VIEW, ...POST, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.ManageThreads, PermissionFlagsBits.CreatePrivateThreads, PermissionFlagsBits.ManageMessages];
 
-const channelSyncs = new Map(); // campaignId -> promise, so one sync runs at a time per campaign
+// One sync at a time per org: the lobby and its threads change together.
+const orgSyncs = new Map();
 function syncCampaignChannel(rec) {
-  const prev = channelSyncs.get(rec.id) || Promise.resolve();
-  const next = prev.then(() => doSyncCampaignChannel(rec)).catch((err) => log(`Channel sync failed for ${rec.id}: ${err.message}`));
-  channelSyncs.set(rec.id, next);
+  const key = first1(rec.fields[C.f.orgLinks]) || rec.id;
+  const prev = orgSyncs.get(key) || Promise.resolve();
+  const next = prev.then(() => doSyncCampaignThread(rec)).catch((err) => log(`Thread sync failed for ${rec.id}: ${err.message}`));
+  orgSyncs.set(key, next);
   return next;
 }
 
-async function doSyncCampaignChannel(rec) {
+async function committedDiscordIds(f) {
+  if (!f[C.f.discordMessageId]) return new Set();
+  const rows = await at.list(K.table, {
+    formula: `AND({${K.names.discordMessageId}}=${at.q(f[C.f.discordMessageId])}, {${K.names.status}}="Committed")`,
+    fields: [K.f.discordUserId],
+  });
+  return new Set(rows.map((r) => r.fields[K.f.discordUserId]).filter(isSnowflake));
+}
+
+async function ensureOrgChannel(guild, org) {
+  const id = org.fields[O.f.channelId];
+  let ch = id ? await guild.channels.fetch(id).catch(() => null) : null;
+  if (ch) return ch;
+  const orgName = org.fields[O.f.organization] || 'Partner';
+  const parent = await ensureCategory(guild, ORG_CATEGORY);
+  ch = await guild.channels.create({
+    name: slug(orgName),
+    type: ChannelType.GuildText,
+    parent: parent.id,
+    topic: `Private space for ${orgName} and the creators working with them. Each long-term campaign has its own thread.`.slice(0, 1024),
+    permissionOverwrites: [
+      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+      { id: client.user.id, allow: BOT_PERMS },
+    ],
+  });
+  await at.update(O.table, org.id, { [O.f.channelId]: ch.id });
+  log(`Created org channel #${ch.name} for ${org.id}`);
+  const welcome = await ch.send({
+    embeds: [
+      new EmbedBuilder()
+        .setTitle(`👋 Welcome to ${orgName}'s space`.slice(0, 256))
+        .setColor(0x5865f2)
+        .setDescription(
+          `This is the private lobby for **${orgName}** and the creators working with them.\n\n` +
+            '• **Lobby (here):** announcements and anything that applies to all of their campaigns. Everyone working with this partner can read it.\n' +
+            '• **Campaign threads:** each long-term campaign has a private thread below. You only see the threads for campaigns you’re confirmed on.\n\n' +
+            'People are added and removed automatically as they join or leave campaigns. When a campaign ends, its thread becomes read-only.'
+        ),
+    ],
+  });
+  await welcome.pin().catch(() => {});
+  return ch;
+}
+
+// Lobby permissions: org contacts + staff always; creators who can post if they're on an active campaign,
+// read-only if all their campaigns with this org have ended (so closed threads stay readable).
+async function syncOrgLobby(guild, org, ch, camps) {
+  const orgIds = new Set(idList(org.fields[O.f.discordUserId]).filter(isSnowflake));
+  const creatorActive = new Map();
+  for (const p of camps) {
+    const active = p.fields[C.f.status] === C.ACTIVE;
+    for (const id of await committedDiscordIds(p.fields)) creatorActive.set(id, creatorActive.get(id) || active);
+  }
+  const desired = [
+    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: client.user.id, allow: BOT_PERMS },
+  ];
+  // Manage Threads lets staff see every private thread without being added to each one.
+  if (STAFF_ROLE_ID) desired.push({ id: STAFF_ROLE_ID, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageThreads] });
+  for (const id of orgIds) desired.push({ id, allow: [...VIEW, ...POST] });
+  for (const [id, active] of creatorActive) {
+    if (orgIds.has(id)) continue;
+    desired.push(active ? { id, allow: [...VIEW, ...POST] } : { id, allow: VIEW, deny: POST });
+  }
+  await ch.permissionOverwrites.set(desired);
+  return orgIds;
+}
+
+async function doSyncCampaignThread(rec) {
   const f = rec.fields;
   if (!f[C.f.longTerm] || !f[C.f.discordMessageId]) return;
+  const orgId = first1(f[C.f.orgLinks]);
+  if (!orgId) return log(`Long-term campaign ${rec.id} has no organization linked, so there's no org channel to put its thread in.`);
   const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
   const closed = f[C.f.status] !== C.ACTIVE;
   const name = f[C.f.shortName] || 'Campaign';
 
-  // Re-read the channel ID from Airtable in case an earlier sync just created it.
-  const fresh = await at.first(C.table, { formula: `RECORD_ID()=${at.q(rec.id)}`, fields: [C.f.channelId] });
-  const channelId = fresh?.fields[C.f.channelId] || f[C.f.channelId];
-  let channel = channelId ? await guild.channels.fetch(channelId).catch(() => null) : null;
-  const isNew = !channel;
-  if (!channel) {
-    if (closed) return; // never create a channel for a closed campaign
-    const parent = await ensureCategory(guild, CAMPAIGN_CATEGORY);
-    channel = await guild.channels.create({
-      name: slug(name),
-      type: ChannelType.GuildText,
-      parent: parent.id,
-      topic: `Private space for "${name}". Everyone who signs up is added automatically.`.slice(0, 1024),
-      permissionOverwrites: [
-        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-        { id: client.user.id, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageChannels] },
-      ],
+  // Re-read IDs in case an earlier sync just created them.
+  const fresh = await at.first(C.table, { formula: `RECORD_ID()=${at.q(rec.id)}`, fields: [C.f.threadId, C.f.oldChannelId] });
+  const threadId = fresh?.fields[C.f.threadId];
+  if (!threadId && closed) return; // never create a thread for a closed campaign
+  const org = await at.first(O.table, { formula: `RECORD_ID()=${at.q(orgId)}`, fields: [O.f.organization, O.f.discordUserId, O.f.proposals, O.f.channelId] });
+  if (!org) return;
+
+  const ch = await ensureOrgChannel(guild, org);
+  const camps = (org.fields[O.f.proposals] || []).length
+    ? (await listByIds(C.table, org.fields[O.f.proposals], [C.f.status, C.f.longTerm, C.f.discordMessageId, C.f.threadId])).filter(
+        (p) => p.fields[C.f.longTerm] && p.fields[C.f.discordMessageId] && (p.fields[C.f.threadId] || p.id === rec.id)
+      )
+    : [];
+  if (!camps.some((p) => p.id === rec.id)) camps.push({ id: rec.id, fields: f });
+  const orgIds = await syncOrgLobby(guild, org, ch, camps); // permissions first, so new people can be added to the thread
+
+  let thread = threadId ? await client.channels.fetch(threadId).catch(() => null) : null;
+  const isNew = !thread;
+  if (!thread) {
+    thread = await ch.threads.create({
+      name: name.slice(0, 100),
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+      reason: `Long-term campaign ${rec.id}`,
     });
-    await at.update(C.table, rec.id, { [C.f.channelId]: channel.id });
-    log(`Created channel #${channel.name} for ${rec.id}`);
+    await at.update(C.table, rec.id, { [C.f.threadId]: thread.id });
+    log(`Created thread "${thread.name}" in #${ch.name} for ${rec.id}`);
   }
 
-  // Who belongs: committed creators + the partner org's linked contacts (+ staff role).
-  const signups = await at.list(K.table, {
-    formula: `AND({${K.names.discordMessageId}}=${at.q(f[C.f.discordMessageId])}, {${K.names.status}}="Committed")`,
-    fields: [K.f.discordUserId],
-  });
-  const creatorIds = new Set(signups.map((r) => r.fields[K.f.discordUserId]).filter(isSnowflake));
-  const orgIds = new Set();
-  const orgLinks = f[C.f.orgLinks] || [];
-  if (orgLinks.length) {
-    const orgs = await listByIds(O.table, orgLinks, [O.f.discordUserId]);
-    orgs.forEach((o) => idList(o.fields[O.f.discordUserId]).filter(isSnowflake).forEach((id) => orgIds.add(id)));
+  if (closed) {
+    if (!thread.locked) {
+      if (thread.archived) await thread.setArchived(false);
+      await thread.send('📦 This campaign is now closed. The thread is read-only. Thanks, everyone!');
+      await thread.setLocked(true);
+      await thread.setArchived(true);
+    }
+    return;
+  }
+  if (thread.archived) await thread.setArchived(false); // Discord hides threads after a quiet week; keep active ones open
+  if (thread.locked) {
+    await thread.setLocked(false);
+    await thread.send('🔓 This campaign has been reopened. Welcome back!');
   }
 
-  const memberPerms = closed ? { allow: VIEW, deny: POST } : { allow: [...VIEW, ...POST] };
-  const desired = [
-    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-    { id: client.user.id, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageChannels] },
-  ];
-  if (STAFF_ROLE_ID) desired.push({ id: STAFF_ROLE_ID, allow: [...VIEW, ...POST] });
-  const members = [...new Set([...creatorIds, ...orgIds])];
-  for (const id of members) desired.push({ id, ...memberPerms });
-
-  const before = new Set(channel.permissionOverwrites.cache.filter((o) => o.type === 1).map((o) => o.id)); // 1 = member overwrite
-  await channel.permissionOverwrites.set(desired);
-
-  // Keep it in the right category: Active vs Archived.
-  const wantParent = await ensureCategory(guild, closed ? ARCHIVE_CATEGORY : CAMPAIGN_CATEGORY);
-  if (channel.parentId !== wantParent.id) {
-    await channel.setParent(wantParent.id, { lockPermissions: false });
-    await channel.permissionOverwrites.set(desired);
-    if (!isNew) await channel.send(
-      closed
-        ? '📦 This campaign is now closed. The channel is archived and read-only. Thanks, everyone!'
-        : '🔓 This campaign has been reopened. Welcome back!'
-    );
+  const want = new Set([...(await committedDiscordIds(f)), ...orgIds]);
+  const current = await thread.members.fetch().catch(() => new Map());
+  const newcomers = [];
+  for (const id of want) {
+    if (current.has(id)) continue;
+    try {
+      await thread.members.add(id);
+      newcomers.push(id);
+    } catch (err) {
+      log(`Couldn't add ${id} to thread ${thread.id}: ${err.message}`);
+    }
+  }
+  for (const id of current.keys()) {
+    if (id === client.user.id || want.has(id)) continue;
+    if (await isStaff(id)) continue; // staff who joined on their own stay
+    await thread.members.remove(id).catch(() => {});
   }
 
   if (isNew) {
     const postLink = `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${f[C.f.discordMessageId]}`;
-    await channel.send({
+    const intro = await thread.send({
       embeds: [
         new EmbedBuilder()
           .setTitle(`👋 Welcome to ${name}`.slice(0, 256))
           .setColor(0x2ecc71)
           .setDescription(
-            `This is the private channel for this long-term campaign.${isInviteKey(f[C.f.discordMessageId]) ? '' : ` [See the campaign post](${postLink}).`}\n\n` +
-              'Creators who sign up are added here automatically, along with the partner organization and the Creator Congress team. ' +
-              'Removing your sign-up removes you from this channel.'
+            `This is the private thread for this long-term campaign.${isInviteKey(f[C.f.discordMessageId]) ? '' : ` [See the campaign post](${postLink}).`}\n\n` +
+              'Confirmed creators are added automatically, along with the partner organization. The Creator Congress team can see it too. ' +
+              'Leaving the campaign removes you from this thread.'
           ),
       ],
     });
+    await intro.pin().catch(() => {});
   }
-  const newcomers = members.filter((id) => !before.has(id));
-  if (!closed && newcomers.length) {
-    await channel.send(`👋 Welcome ${newcomers.map((id) => `<@${id}>`).join(' ')}!`);
+  const creatorsNew = newcomers.filter((id) => !orgIds.has(id));
+  if (creatorsNew.length && !isNew) await thread.send(`👋 Welcome ${creatorsNew.map((id) => `<@${id}>`).join(' ')}!`);
+  if (isNew && newcomers.length) await thread.send(`👋 Welcome ${newcomers.map((id) => `<@${id}>`).join(' ')}!`);
+
+  // Move over an old one-channel-per-campaign channel: point people to the thread and make the old one read-only.
+  const oldId = fresh?.fields[C.f.oldChannelId];
+  if (oldId) {
+    const old = await guild.channels.fetch(oldId).catch(() => null);
+    if (old) {
+      await old.send(`➡️ This campaign has moved to a thread in ${ch}: <#${thread.id}>. This channel is now read-only and kept for history.`).catch(() => {});
+      const keep = old.permissionOverwrites.cache.filter((o) => o.type === 1 && o.id !== client.user.id).map((o) => ({ id: o.id, allow: VIEW, deny: POST }));
+      const archive = await ensureCategory(guild, ARCHIVE_CATEGORY);
+      await old.setParent(archive.id, { lockPermissions: false }).catch(() => {});
+      await old.permissionOverwrites.set([
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        { id: client.user.id, allow: BOT_PERMS },
+        ...(STAFF_ROLE_ID ? [{ id: STAFF_ROLE_ID, allow: VIEW }] : []),
+        ...keep,
+      ]).catch(() => {});
+      log(`Moved old channel #${old.name} → thread ${thread.id}`);
+    }
+    await at.update(C.table, rec.id, { [C.f.oldChannelId]: '' });
   }
+}
+
+// Every 30 minutes: re-check active long-term threads (reopens threads Discord auto-archived, fixes any drift).
+let lastThreadSweep = 0;
+async function sweepCampaignThreads() {
+  if (Date.now() - lastThreadSweep < 30 * 60_000) return;
+  lastThreadSweep = Date.now();
+  const recs = await at.list(C.table, {
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.longTerm}}, {${C.names.threadId}}!="")`,
+    fields: Object.values(C.f),
+  });
+  for (const rec of recs) await syncCampaignChannel(rec);
 }
 
 // ---------- members & commitments ----------
@@ -479,8 +597,10 @@ client.on('messageReactionAdd', async (reaction, user) => {
       : '';
     if (changed && pending) {
       await dm(user, `🙋 Your request to join **${hit.campaign.name}** is in! ${hit.campaign.org} reviews each sign-up for this campaign, and we'll DM you as soon as you're confirmed. Remove your ${SIGNUP_EMOJI} anytime to cancel.${linkNote}`);
-    } else if (linkNote) {
-      await dm(user, `Thanks for signing up for **${hit.campaign.name}**! We've recorded it.${linkNote}`);
+    } else if (changed) {
+      const campFields = await campaignFieldsById(hit.campaign.id);
+      if (campFields) await announceConfirmed({ campFields, user, headline: `✅ You're signed up for **${hit.campaign.name}**!`, extra: linkNote });
+      else await dm(user, `Thanks for signing up for **${hit.campaign.name}**! We've recorded it.${linkNote}`);
     }
   } catch (err) {
     log('reactionAdd error', err);
@@ -575,7 +695,7 @@ async function loadRequest(recordId) {
   if (!req) return null;
   const campaignId = (req.fields[K.f.campaign] || [])[0];
   const camp = campaignId
-    ? await at.first(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: [C.f.shortName, C.f.orgName, C.f.orgLinks, C.f.longTerm, C.f.channelId, C.f.discordMessageId] })
+    ? await at.first(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: [C.f.shortName, C.f.orgName, C.f.orgLinks, C.f.longTerm, C.f.threadId, C.f.discordMessageId] })
     : null;
   const creatorId = (req.fields[K.f.creator] || [])[0];
   const creator = creatorId
@@ -686,9 +806,10 @@ async function handleReviewButton(interaction) {
   const messageId = req.fields[K.f.discordMessageId];
   const creatorUser = isSnowflake(req.fields[K.f.discordUserId]) ? await client.users.fetch(req.fields[K.f.discordUserId]).catch(() => null) : null;
 
+  const campFields = (await campaignFieldsById(camp.id)) || camp.fields;
+  const cid = (req.fields[K.f.creator] || [])[0];
   if (approve) {
-    const channelNote = camp.fields[C.f.longTerm] ? ' You’ll be added to the campaign’s private channel in a moment.' : '';
-    if (creatorUser) await dm(creatorUser, `🎉 You're in! You've been confirmed for **${campName}**.${channelNote} The Creator Congress team will follow up with next steps.`);
+    announceConfirmed({ campFields, creatorId: cid, user: creatorUser }).catch((err) => log('announce error', err));
   } else {
     // Quietly remove their reaction so the post reflects reality (the remove event is ignored for Declined).
     try {
@@ -708,10 +829,9 @@ async function handleReviewButton(interaction) {
     }
   }
   scheduleRefresh(messageId, camp.id); // updates the spot count and private-channel access
-  const cid = (req.fields[K.f.creator] || [])[0];
-  if (cid) {
+  if (cid && !approve) {
     const contact = await at.first(M.table, { formula: `RECORD_ID()=${at.q(cid)}`, fields: CREATOR_CONTACT_FIELDS() });
-    if (contact) await emailDecision(contact, campName, approve, !!camp.fields[C.f.longTerm]).catch((err) => log('email error', err));
+    if (contact) await emailDecision(contact, campFields, false).catch((err) => log('email error', err));
   }
 
   const done = EmbedBuilder.from(interaction.message.embeds[0])
@@ -932,7 +1052,7 @@ async function sendInvites(rec) {
 
 async function handleInviteButton(interaction) {
   const [, action, rowId] = interaction.customId.split(':');
-  const row = await at.first(K.table, { formula: `RECORD_ID()=${at.q(rowId)}`, fields: [K.f.status, K.f.discordUserId, K.f.campaign, K.f.discordMessageId] });
+  const row = await at.first(K.table, { formula: `RECORD_ID()=${at.q(rowId)}`, fields: [K.f.status, K.f.discordUserId, K.f.campaign, K.f.discordMessageId, K.f.creator] });
   if (!row) return interaction.reply({ content: 'This invitation no longer exists.', flags: MessageFlags.Ephemeral });
   if (row.fields[K.f.discordUserId] !== interaction.user.id) return interaction.reply({ content: 'This invitation is for someone else.', flags: MessageFlags.Ephemeral });
   const campaignId = (row.fields[K.f.campaign] || [])[0];
@@ -954,13 +1074,18 @@ async function handleInviteButton(interaction) {
   });
   scheduleRefresh(row.fields[K.f.discordMessageId], campaignId);
   log(`Invite ${row.id} ${accept ? 'accepted' : 'declined'}`);
+  if (accept) {
+    campaignFieldsById(campaignId)
+      .then((campFields) => announceConfirmed({ campFields, creatorId: first1(row.fields[K.f.creator]), user: interaction.user, headline: `🎉 You've accepted, and you're confirmed for **${name}**!` }))
+      .catch((err) => log('announce error', err));
+  }
   const base = interaction.message.embeds[0] ? EmbedBuilder.from(interaction.message.embeds[0]) : new EmbedBuilder().setTitle(name);
   base
     .setAuthor({ name: accept ? '✅  YOU’RE IN' : '👋  NO THANKS SENT' })
     .setColor(accept ? 0x2ecc71 : 0x4f545c)
     .setFooter({
       text: accept
-        ? `Confirmed! The Creator Congress team will follow up with next steps.${camp?.fields[C.f.longTerm] ? ' You’ll be added to the private campaign channel in a moment.' : ''}`
+        ? `Confirmed! We've DMed you your contact and payment details.${camp?.fields[C.f.longTerm] ? ' You’ll be added to the campaign’s private thread in a moment.' : ''}`
         : 'Thanks for letting us know. This won’t affect future invitations.',
     });
   return interaction.update({ embeds: [base], components: [] });
@@ -1147,6 +1272,102 @@ function pageLine(cf) {
 }
 const hi = (cf) => `Hi ${cf[M.f.firstName] || String(cf[M.f.fullName] || '').split(' ')[0] || 'there'},`;
 
+// ---- org lead contact + payment details (shown to confirmed creators only) ----
+// The org lead handles the work and payment. Lead Contact Name/Email on the proposal win;
+// otherwise we use the contact on the org's application.
+function leadContact(f) {
+  const firstOf = (v) => String((Array.isArray(v) ? v.find(Boolean) : v) || '').trim();
+  const name = String(f[C.f.leadName] || '').trim() || `${firstOf(f[C.f.orgFirst])} ${firstOf(f[C.f.orgLast])}`.trim();
+  const email = String(f[C.f.leadEmail] || '').trim() || firstOf(f[C.f.orgEmail]);
+  const org = (f[C.f.orgName] || []).filter(Boolean).join(', ');
+  const payment = String(f[C.f.paymentDetails] || '').trim();
+  return { name, email, org, payment };
+}
+
+async function campaignFieldsById(id) {
+  if (!id) return null;
+  const r = await at.first(C.table, { formula: `RECORD_ID()=${at.q(id)}`, fields: Object.values(C.f) });
+  return r?.fields || null;
+}
+
+// Markdown block for Discord DMs and emails.
+function contactMd(f, { email = false } = {}) {
+  const { name, email: addr, org, payment } = leadContact(f);
+  const who = [name || null, org && org !== name ? org : null].filter(Boolean).join(', ');
+  const camp = f[C.f.shortName] || 'Creator Congress campaign';
+  const mail = addr ? (email ? `[${addr}](mailto:${addr}?subject=${encodeURIComponent(camp)})` : addr) : '';
+  const lines = [];
+  if (who || mail) lines.push(`**Your contact:** ${[who, mail].filter(Boolean).join(' · ')}\nReach out to them with questions about the work and about getting paid.`);
+  else lines.push('**Your contact:** the Creator Congress team will connect you with the partner lead.');
+  if (payment) lines.push(`**Getting paid:**\n${payment.length > 1500 ? payment.slice(0, 1500) + '…' : payment}`);
+  else if (who || mail) lines.push(`**Getting paid:** payment details haven't been posted yet. Ask ${name || 'your contact'} if you have questions.`);
+  return lines.join('\n\n');
+}
+
+// Tiny, safe markdown → HTML for the Payment Details rich text (bold, italic, links, lists, headings).
+function mdToHtml(md) {
+  const inline = (t) =>
+    esc(t)
+      .replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:)[^\s)]+)\)/g, (_, txt, url) => `<a href="${url}" target="_blank" rel="noopener">${txt}</a>`)
+      .replace(/(^|[\s(])((?:https?:\/\/)[^\s<]+[^\s<.,;:!?)])/g, (_, pre, url) => `${pre}<a href="${url}" target="_blank" rel="noopener">${url}</a>`)
+      .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+      .replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<i>$2</i>')
+      .replace(/(^|\W)_([^_]+)_(?=\W|$)/g, '$1<i>$2</i>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+  const out = [];
+  let list = null;
+  const close = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const raw of String(md || '').replace(/\r/g, '').split('\n')) {
+    const line = raw.replace(/\s+$/, '');
+    let m;
+    if ((m = line.match(/^\s*[-*+]\s+(?:\[[ xX]\]\s+)?(.*)$/))) {
+      if (list !== 'ul') { close(); out.push('<ul>'); list = 'ul'; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      if (list !== 'ol') { close(); out.push('<ol>'); list = 'ol'; }
+      out.push(`<li>${inline(m[1])}</li>`);
+    } else if ((m = line.match(/^#{1,6}\s+(.*)$/))) {
+      close(); out.push(`<p><b>${inline(m[1])}</b></p>`);
+    } else if (!line.trim()) {
+      close();
+    } else {
+      close(); out.push(`<p>${inline(line)}</p>`);
+    }
+  }
+  close();
+  return out.join('');
+}
+
+// HTML block for the creator's campaigns page.
+function contactHtml(f) {
+  const { name, email, org, payment } = leadContact(f);
+  const camp = f[C.f.shortName] || 'Creator Congress campaign';
+  const who = name || org || 'the partner lead';
+  const mailto = email ? `mailto:${encodeURIComponent(email).replace(/%40/g, '@')}?subject=${encodeURIComponent(camp)}` : '';
+  const person = name || email
+    ? `<p class="who"><b>${esc(name || email)}</b>${org && org !== name ? ` · ${esc(org)}` : ''}</p>
+       <p class="muted">Your point of contact for the work and for getting paid.</p>
+       ${email ? `<div class="actions"><a class="btn primary" href="${esc(mailto)}">✉️ Email ${esc(name ? name.split(' ')[0] : 'them')}</a><span class="muted">${esc(email)}</span></div>` : ''}`
+    : `<p class="muted">The Creator Congress team will connect you with the partner lead.</p>`;
+  const pay = payment
+    ? `<div class="md">${mdToHtml(payment)}</div>`
+    : `<p class="muted">Payment details haven't been posted yet.${email ? ` Questions about payment? Email ${esc(who)}.` : ''}</p>`;
+  return `<div class="contact"><div class="contact-h">🤝 Your contact</div>${person}<div class="contact-h">💸 Getting paid</div>${pay}</div>`;
+}
+
+// Tell a creator they're confirmed, with their contact + payment details (DM if on Discord, email per their setting).
+async function announceConfirmed({ campFields, creatorId, discordUserId, user, headline, extra = '' }) {
+  if (!campFields) return;
+  const name = campFields[C.f.shortName] || 'the campaign';
+  const channelNote = campFields[C.f.longTerm] ? ' You’ll be added to the campaign’s private thread in the partner’s channel in a moment.' : '';
+  const target = user || (isSnowflake(discordUserId) ? await client.users.fetch(discordUserId).catch(() => null) : null);
+  if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}\n\n${contactMd(campFields)}${extra}`);
+  if (creatorId) {
+    const contact = await at.first(M.table, { formula: `RECORD_ID()=${at.q(creatorId)}`, fields: CREATOR_CONTACT_FIELDS() });
+    if (contact) await emailDecision(contact, campFields, true).catch((err) => log('email error', err));
+  }
+}
+
 function campaignSummaryMd(f) {
   const bits = [
     f[C.f.creatorPay] ? `**Pay:** ${money(Number(f[C.f.creatorPay]))}` : null,
@@ -1169,15 +1390,17 @@ async function emailInvite(creator, campaignFields, { reminder = false } = {}) {
   });
 }
 
-async function emailDecision(creator, campaignName, approved, longTerm) {
+async function emailDecision(creator, campFields, approved) {
   const cf = creator.fields;
+  const campaignName = campFields[C.f.shortName] || 'the campaign';
+  const longTerm = !!campFields[C.f.longTerm];
   return queueEmail({
     creator,
     kind: approved ? 'Confirmed' : 'Not selected',
     subject: approved ? `You're in: ${campaignName}` : `Update on ${campaignName}`,
     body: approved
-      ? `${hi(cf)}\n\nGood news: you've been confirmed for **${campaignName}**! The Creator Congress team will follow up with next steps.` +
-        (longTerm ? '\n\nThis campaign coordinates in a private Discord channel. If you’re not on Discord, the team will help you get set up or keep you updated by email.' : '') +
+      ? `${hi(cf)}\n\nGood news: you've been confirmed for **${campaignName}**!\n\n${contactMd(campFields, { email: true })}` +
+        (longTerm ? '\n\nThis campaign coordinates in a private Discord thread in the partner’s channel. If you’re not on Discord, the team will help you get set up or keep you updated by email.' : '') +
         pageLine(cf)
       : `${hi(cf)}\n\nThanks so much for your interest in **${campaignName}**. The partner wasn't able to bring you on for this one, but that's no reflection on your work. Partners often have very specific needs for each campaign.\n\nThere are always more opportunities coming. We'd love to see you on the next one!` +
         pageLine(cf),
@@ -1185,8 +1408,22 @@ async function emailDecision(creator, campaignName, approved, longTerm) {
 }
 
 // Every approved creator gets a private page token + link (needs PUBLIC_URL).
+// PUBLIC_URL with https:// added if it was entered without it.
+const publicBase = () => {
+  const u = String(PUBLIC_URL || '').trim().replace(/\/+$/, '');
+  return !u ? '' : /^https?:\/\//i.test(u) ? u : `https://${u}`;
+};
+
 async function ensurePortalTokens() {
   if (!PUBLIC_URL) return;
+  // Repair any links saved without https:// (they don't open when clicked).
+  const broken = await at.list(M.table, {
+    formula: `AND({${M.names.portalToken}}!="", {Campaigns Page Link}!="", LEFT({Campaigns Page Link}, 4)!="http")`,
+    fields: [M.f.portalToken],
+    maxRecords: 100,
+  });
+  for (const r of broken) await at.update(M.table, r.id, { [M.f.pageLink]: `${publicBase()}/c/${r.fields[M.f.portalToken]}` });
+  if (broken.length) log(`Repaired ${broken.length} campaigns-page link(s) missing https://`);
   const rows = await at.list(M.table, {
     formula: `AND({${M.names.approved}}, {${M.names.portalToken}}="")`,
     fields: CREATOR_CONTACT_FIELDS(),
@@ -1194,7 +1431,7 @@ async function ensurePortalTokens() {
   });
   for (const r of rows) {
     const token = randomBytes(16).toString('hex');
-    const link = `${PUBLIC_URL.replace(/\/$/, '')}/c/${token}`;
+    const link = `${publicBase()}/c/${token}`;
     await at.update(M.table, r.id, { [M.f.portalToken]: token, [M.f.pageLink]: link });
     // Optional one-time welcome email with their link (set SEND_WELCOME_EMAILS=1 in Railway to turn on).
     if (process.env.SEND_WELCOME_EMAILS === '1') {
@@ -1293,7 +1530,10 @@ async function webJoin(creator, camp, mine, via = 'Web page') {
   const row = existing ? await at.update(K.table, existing.id, fields) : await at.create(K.table, fields);
   log(`Web ${pending ? 'request' : 'join'}: ${creator.id} → ${camp.id}`);
   if (pending) notifyReviewers(row.id).catch((err) => log('notifyReviewers error', err));
-  else scheduleRefresh(key, camp.id);
+  else {
+    scheduleRefresh(key, camp.id);
+    announceConfirmed({ campFields: camp.fields, creatorId: creator.id, discordUserId: did, headline: `✅ You're signed up for **${camp.fields[C.f.shortName] || 'the campaign'}**!` }).catch((err) => log('announce error', err));
+  }
   return pending ? 'requested' : 'joined';
 }
 
@@ -1332,6 +1572,11 @@ async function respondToInvite(rowId, accept) {
   });
   scheduleRefresh(row.fields[K.f.discordMessageId], campaignId);
   log(`Invite ${row.id} ${accept ? 'accepted' : 'declined'}`);
+  if (accept) {
+    campaignFieldsById(campaignId)
+      .then((campFields) => announceConfirmed({ campFields, creatorId: first1(row.fields[K.f.creator]), discordUserId: row.fields[K.f.discordUserId], headline: `🎉 You've accepted, and you're confirmed for **${camp.fields[C.f.shortName] || 'the campaign'}**!` }))
+      .catch((err) => log('announce error', err));
+  }
   return { result: accept ? 'accepted' : 'passed', row, camp };
 }
 
@@ -1364,6 +1609,23 @@ button.primary{background:var(--accent);border-color:var(--accent);color:var(--a
 .flash{border-radius:10px;padding:12px 14px;margin:16px 0;background:var(--soft);color:var(--ink);border:1px solid var(--line)}
 .empty{color:var(--muted);font-size:15px}
 footer{margin-top:40px;font-size:13px;color:var(--muted)}
+.contact{margin:12px 0 4px;padding:12px 14px;border:1px solid var(--line);border-radius:10px;background:var(--soft)}
+.contact-h{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--accent);margin:2px 0 4px}
+.contact-h:not(:first-child){margin-top:14px}.contact p{margin:4px 0}.contact .who{font-size:16px}
+.muted{color:var(--muted);font-size:14px}.md{font-size:15px}.md ul,.md ol{margin:4px 0;padding-left:20px}.md a,.contact a{color:var(--accent)}
+a.btn{display:inline-block;font-weight:600;border-radius:8px;padding:8px 14px;text-decoration:none;border:1px solid var(--line)}
+a.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.past{padding:6px 0;border-bottom:1px solid var(--line)}.past:last-child{border-bottom:0}
+.pay{margin:12px 0 4px;padding:10px 14px;border-radius:10px;border:1px solid var(--line)}.pay p{margin:4px 0}
+.pay.orgsayspaid,.pay.paymentdue{background:var(--warn-soft);border-color:transparent}.pay.paid{background:var(--soft);border-color:transparent}
+.pay.issue{background:#fde8e8;border-color:transparent;color:#8a1f1f}
+@media (prefers-color-scheme:dark){.pay.issue{background:#3a1c1c;color:#f3b0b0}}
+.notpaid summary{font-size:14px;padding:8px 0}.notpaid form{display:flex;flex-direction:column;gap:8px;margin-top:6px}
+textarea,input{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--ink);max-width:100%}
+.row{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+.row-main{flex:1 1 260px;min-width:0}.row-main a{color:var(--accent);word-break:break-all}
+.paystat{font-size:14px;margin-top:2px}.paystat.paid{color:var(--accent)}.paystat.issue{color:#b42318}.paystat.paymentdue{color:var(--warn)}
+.markpaid{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.markpaid label{font-size:14px;color:var(--muted)}.markpaid input[name=note]{flex:1 1 180px}
 `;
 
 function campaignCard(p, { mineRow, inviteRow, token }) {
@@ -1404,28 +1666,33 @@ function campaignCard(p, { mineRow, inviteRow, token }) {
   ${details ? `<details><summary>Campaign details</summary><p>${esc(details)}</p></details>` : ''}
   ${mode === 'review' && !inviteRow ? `<div class="note">🙋 Partner-reviewed: ${esc(org || 'the partner')} approves each creator. You'll be emailed when you're confirmed.</div>` : ''}
   ${inviteRow ? `<div class="note violet">✉️ You were personally invited to this campaign.</div>` : ''}
-  ${f[C.f.longTerm] ? `<div class="note violet">🔒 Long-term: this campaign coordinates in a private Discord channel. Not on Discord? The team will keep you posted by email.</div>` : ''}
+  ${status === 'Committed' ? paymentHtml(mineRow, token) + contactHtml(f) : ''}
+  ${f[C.f.longTerm] ? `<div class="note violet">🔒 Long-term: this campaign coordinates in a private Discord thread with the partner. Not on Discord? The team will keep you posted by email.</div>` : ''}
   <div class="actions">${actions}</div>
 </div>`;
 }
 
 const FLASH = {
-  joined: "🎉 You're in! The Creator Congress team will follow up with next steps.",
+  joined: "🎉 You're in! Your contact and payment details are on the campaign card below.",
   requested: "🙋 Request sent! The partner reviews each sign-up and you'll get an email once you're confirmed.",
   left: "You've left the campaign. You can rejoin anytime while it's open.",
-  accepted: "🎉 You've accepted the invitation and you're confirmed! The team will follow up with next steps.",
+  accepted: "🎉 You've accepted the invitation and you're confirmed! Your contact and payment details are on the campaign card below.",
   passed: "Thanks for letting us know. This won't affect future invitations.",
   already: "You're already signed up for that one.",
   declined: "The partner has already made a decision on your request for this campaign.",
   full: 'Sorry, that campaign just filled up.',
   closed: 'That campaign has closed.',
   answered: "You've already responded to that invitation.",
+  confirmedpaid: "✅ Thanks for confirming you were paid! We've let the partner know.",
+  reported: "Thanks for letting us know. The partner and the Creator Congress team have been alerted, and someone will follow up.",
+  alreadypaid: 'That payment is already confirmed.',
+  notdue: "That campaign hasn't ended yet, so payment isn't due. Questions? Email your contact on the campaign.",
 };
 
 async function renderCreatorPage(creator, token, flash) {
   const cf = creator.fields;
   const mine = (cf[M.f.commitments] || []).length
-    ? await listByIds(K.table, cf[M.f.commitments], [K.f.status, K.f.campaign, K.f.discordMessageId, K.f.discordUserId, K.f.campaignPay])
+    ? await listByIds(K.table, cf[M.f.commitments], [...PAY_FIELDS(), K.f.discordMessageId])
     : [];
   const open = await listOpenCampaigns();
   const campIds = [...new Set(mine.map((r) => first1(r.fields[K.f.campaign])).filter(Boolean))];
@@ -1442,6 +1709,8 @@ async function renderCreatorPage(creator, token, flash) {
   const pendingMine = mine.filter((r) => r.fields[K.f.status] === 'Pending').length;
   const payOf = (x) => Number(first1(x.r.fields[K.f.campaignPay])) || 0;
   const expected = confirmed.reduce((t, x) => t + payOf(x), 0);
+  const paidSoFar = confirmed.filter((x) => x.r.fields[K.f.paymentStatus] === 'Paid').reduce((t, x) => t + rowAmount(x.r), 0);
+  const toConfirm = confirmed.filter((x) => isPaidCampaignRow(x.r) && ['Org says paid', 'Payment due'].includes(payStatusOf(x.r)));
   const joinedIds = new Set(activeMine.map((x) => x.p.id));
   const browse = open.filter((p) => !joinedIds.has(p.id));
 
@@ -1452,15 +1721,17 @@ async function renderCreatorPage(creator, token, flash) {
 ${flash && FLASH[flash] ? `<div class="flash">${esc(FLASH[flash])}</div>` : ''}
 <div class="stats">
   <div class="stat"><b>${esc(money(expected) || '$0')}</b>expected pay</div>
+  <div class="stat"><b>${esc(money(paidSoFar) || '$0')}</b>paid so far</div>
   <div class="stat"><b>${activeMine.length}</b>active</div>
   ${pendingMine ? `<div class="stat"><b>${pendingMine}</b>awaiting approval</div>` : ''}
   ${invites.length ? `<div class="stat"><b>${invites.length}</b>invitation${invites.length === 1 ? '' : 's'}</div>` : ''}
 </div>
+${toConfirm.some((x) => payStatusOf(x.r) === 'Org says paid') ? `<div class="flash">💸 A partner says they've paid you. Please confirm below whether it arrived.</div>` : ''}
 ${invites.length ? section('✉️ Your invitations', invites.map((x) => campaignCard(x.p, { inviteRow: x.r, token })).join('')) : ''}
 ${section('Open campaigns', browse.length ? browse.map((p) => campaignCard(p, { mineRow: rowFor(p), token })).join('') : '<p class="empty">No open campaigns right now. We’ll email you when new ones are posted.</p>')}
 ${activeMine.length ? section('Your active campaigns', activeMine.map((x) => campaignCard(x.p, { mineRow: x.r, token })).join('')) : ''}
-${pastMine.length ? section('Past campaigns', `<div class="card">${pastMine.map((x) => `<div>✓ <b>${esc(x.p.fields[C.f.shortName])}</b>${payOf(x) ? ` · ${esc(money(payOf(x)))}` : ''}</div>`).join('')}</div>`) : ''}
-<footer>Expected pay is an estimate based on campaign rates, not a confirmed payment. This page is private to you, so please don't share the link. Prefer Discord? Join our server and use <b>/link</b> with this email. Questions? Reply to any Creator Congress email.</footer>`;
+${pastMine.length ? section('Past campaigns', `<div class="card">${pastMine.map((x) => `<div class="past">✓ <b>${esc(x.p.fields[C.f.shortName])}</b>${payOf(x) ? ` · ${esc(money(payOf(x)))}` : ''}${paymentHtml(x.r, token)}<details><summary>Contact &amp; payment details</summary>${contactHtml(x.p.fields)}</details></div>`).join('')}</div>`) : ''}
+<footer>Expected pay is an estimate based on campaign rates. "Paid so far" counts payments you've confirmed you received. This page is private to you, so please don't share the link. Prefer Discord? Join our server and use <b>/link</b> with this email. Questions? Reply to any Creator Congress email.</footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Your campaigns · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
 }
 
@@ -1485,6 +1756,36 @@ function startWebServer() {
     try {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
+      // Partner (org) page
+      const om = url.pathname.match(/^\/o\/([a-f0-9]{32})(?:\/paid\/(rec[A-Za-z0-9]{14}))?\/?$/);
+      if (om) {
+        const [, otoken, payRowId] = om;
+        const org = await orgByToken(otoken);
+        if (!org || !org.fields[O.f.approved]) return send(res, 404, simple('Link not recognized', 'This link may have expired. Contact the Creator Congress team for a new one.'));
+        if (req.method === 'POST' && payRowId) {
+          const form = await readForm(req);
+          const props = (org.fields[O.f.proposals] || []).length ? await listByIds(C.table, org.fields[O.f.proposals], [C.f.commitments]) : [];
+          const ours = props.some((p) => (p.fields[C.f.commitments] || []).includes(payRowId));
+          const result = ours ? await markPaidByOrg(payRowId, { amount: form.amount, note: form.note, by: `${org.fields[O.f.organization] || 'Org'} (partner page)` }) : 'missing';
+          res.writeHead(303, { Location: `/o/${otoken}?done=${encodeURIComponent(result)}`, 'Cache-Control': 'no-store' });
+          return res.end();
+        }
+        if (req.method !== 'GET') return send(res, 405, simple('Not allowed', ''));
+        return send(res, 200, await renderOrgPage(org, otoken, url.searchParams.get('done')));
+      }
+      // Creator: confirm or report a payment
+      const pm = url.pathname.match(/^\/c\/([a-f0-9]{32})\/pay\/(rec[A-Za-z0-9]{14})\/(yes|no)\/?$/);
+      if (pm && req.method === 'POST') {
+        const [, ptoken, rowId, answer] = pm;
+        const creator = await creatorByToken(ptoken);
+        if (!creator || !creator.fields[M.f.approved]) return send(res, 404, simple('Link not recognized', 'This link may have expired.'));
+        const form = await readForm(req);
+        const result = !(creator.fields[M.f.commitments] || []).includes(rowId)
+          ? 'missing'
+          : answer === 'yes' ? await confirmPaidByCreator(rowId) : await reportNotPaid(rowId, { note: form.note });
+        res.writeHead(303, { Location: `/c/${ptoken}?done=${encodeURIComponent(result)}`, 'Cache-Control': 'no-store' });
+        return res.end();
+      }
       const m = url.pathname.match(/^\/c\/([a-f0-9]{32})(?:\/(join|leave)\/(rec[A-Za-z0-9]{14})|\/invite\/(rec[A-Za-z0-9]{14})\/(accept|decline))?\/?$/);
       if (!m) return send(res, 404, simple('Page not found', 'Check the link in your Creator Congress email.'));
       const [, token, verb, campId, inviteId, inviteAction] = m;
@@ -1524,7 +1825,7 @@ function startWebServer() {
 // The portal only records what the creator wants; the bot applies the same rules as Discord and the web page.
 
 const PORTAL_RESULT = {
-  joined: ["Done", "You're in! The Creator Congress team will follow up with next steps."],
+  joined: ["Done", "You're in! Your contact and payment details are on My Campaigns."],
   requested: ["Done", "Request sent. The partner reviews each sign-up, and you'll be emailed once you're confirmed."],
   left: ["Done", "You've left the campaign. You can rejoin anytime while it's open."],
   accepted: ["Done", "Invitation accepted. You're confirmed! The team will follow up with next steps."],
@@ -1538,6 +1839,11 @@ const PORTAL_RESULT = {
   noinvite: ["Couldn't complete", "We couldn't find an invitation for you on this campaign."],
   inviteonly: ["Couldn't complete", 'This campaign is invite-only. Watch your email and portal for invitations.'],
   nocreator: ["Couldn't complete", "We couldn't find an approved Creator Congress profile with this email. Contact the team."],
+  confirmedpaid: ['Done', "Thanks for confirming you were paid! We've let the partner know."],
+  reported: ['Done', 'Thanks for letting us know. The partner and the Creator Congress team have been alerted.'],
+  alreadypaid: ['Done', 'This payment is already confirmed.'],
+  notdue: ["Couldn't complete", "This campaign hasn't ended yet, so payment isn't due."],
+  missing: ["Couldn't complete", "We couldn't find your sign-up for this campaign."],
 };
 
 async function creatorForPortal({ email, creatorId }) {
@@ -1562,6 +1868,11 @@ async function runPortalAction(creator, camp, action) {
     return webJoin(creator, camp, mine, 'Portal');
   }
   if (action === 'Leave') return webLeave(creator, camp, mine);
+  if (action === 'I got paid' || action === "I wasn't paid") {
+    const row = mine.find((r) => first1(r.fields[K.f.campaign]) === camp.id && r.fields[K.f.status] === 'Committed');
+    if (!row) return 'none';
+    return action === 'I got paid' ? confirmPaidByCreator(row.id) : reportNotPaid(row.id);
+  }
   const inv = mine.find((r) => first1(r.fields[K.f.campaign]) === camp.id && r.fields[K.f.status] === 'Invited')
     || mine.find((r) => first1(r.fields[K.f.campaign]) === camp.id && ['Committed', 'Declined invite'].includes(r.fields[K.f.status]) && isInviteKey(r.fields[K.f.discordMessageId]));
   if (!inv) return 'noinvite';
@@ -1640,6 +1951,536 @@ async function portalTick() {
   }
 }
 
+// ---------- payments: the org marks paid, the creator confirms ----------
+// A payment only counts as Paid once the creator confirms it (or after 14 days of silence once the org marked it).
+// Statuses: (blank)/Not due yet → Payment due (campaign ended) → Org says paid → Paid. Issue = creator says
+// not paid, or 7+ days overdue; staff are alerted. Staff can also set any status by hand in Airtable.
+
+const PAY = {
+  DUE_DAYS: 30, OVERDUE_FLAG_DAYS: 7, CREATOR_REMIND_DAYS: 7, AUTO_CONFIRM_DAYS: 14, TICK_MINUTES: 10,
+  // Payments due before this date (YYYY-MM-DD) don't trigger overdue reminders or staff flags, so turning this on
+  // doesn't flood orgs about campaigns paid before the system existed. Override with PAYMENTS_START in Railway.
+  START: process.env.PAYMENTS_START || '2026-10-16',
+};
+
+const PAY_FIELDS = () => [
+  K.f.title, K.f.status, K.f.campaign, K.f.creator, K.f.discordUserId, K.f.creatorName, K.f.campaignName, K.f.campaignStatus,
+  K.f.campaignPay, K.f.campaignEndDate, K.f.orgName, K.f.creatorEmail, K.f.paymentStatus, K.f.amountPaid, K.f.orgPaidAt,
+  K.f.orgPaidBy, K.f.paymentNote, K.f.creatorAskedAt, K.f.paidConfirmedAt, K.f.paidConfirmedBy, K.f.paymentReminders,
+  K.f.paymentFlagged, K.f.paymentDueDate,
+];
+
+const todayEt = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD
+const daysSince = (iso) => (iso ? (Date.now() - new Date(iso).getTime()) / 86_400_000 : 0);
+const rowPay = (r) => Number(first1(r.fields[K.f.campaignPay])) || 0;
+const rowAmount = (r) => Number(r.fields[K.f.amountPaid]) || rowPay(r);
+const rowCreatorName = (r) => first1(r.fields[K.f.creatorName]) || 'A creator';
+const rowCampName = (r) => first1(r.fields[K.f.campaignName]) || 'the campaign';
+const isPaidCampaignRow = (r) => rowPay(r) > 0 || Number(r.fields[K.f.amountPaid]) > 0;
+function campaignEnded(r) {
+  const end = first1(r.fields[K.f.campaignEndDate]);
+  if (end && end < todayEt()) return true;
+  return first1(r.fields[K.f.campaignStatus]) !== C.ACTIVE;
+}
+// What the creator/org should see, even before the bot has written a status.
+function payStatusOf(r) {
+  const s = r.fields[K.f.paymentStatus];
+  if (s && s !== 'Not due yet') return s;
+  return campaignEnded(r) ? 'Payment due' : 'Not due yet';
+}
+const PAY_LABEL = {
+  'Not due yet': '⏳ Not due yet',
+  'Payment due': '💸 Payment due',
+  'Org says paid': '📤 Org says paid',
+  Paid: '✅ Paid',
+  Issue: '⚠️ Payment issue',
+};
+const PAY_EMOJI = { 'Not due yet': '⏳', 'Payment due': '💸', 'Org says paid': '📤', Paid: '✅', Issue: '⚠️' };
+const stamp = () => new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
+const addNote = (r, who, note) => {
+  const n = String(note || '').trim();
+  if (!n) return r.fields[K.f.paymentNote] || null;
+  return [r.fields[K.f.paymentNote], `${who} (${stamp()}): ${n}`].filter(Boolean).join('\n').slice(0, 5000);
+};
+
+async function loadPayRow(rowId) {
+  if (!/^rec[A-Za-z0-9]{14}$/.test(String(rowId))) return null;
+  return at.first(K.table, { formula: `RECORD_ID()=${at.q(rowId)}`, fields: PAY_FIELDS() });
+}
+
+// Plain email to an address with no creator record (org leads).
+async function queueRawEmail({ to, subject, body, kind }) {
+  if (!to) return false;
+  await at.create(OUTBOX.table, { [OUTBOX.f.subject]: subject.slice(0, 250), [OUTBOX.f.to]: to, [OUTBOX.f.body]: body, [OUTBOX.f.kind]: kind });
+  log(`Queued ${kind} email to org contact`);
+  return true;
+}
+
+// Tell the org: DM every linked org contact; email the lead if nobody is linked on Discord (or always: true).
+async function notifyOrg(campFields, { dmText, subject, body, always = false }) {
+  if (!campFields) return;
+  const orgs = (campFields[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.discordUserId, O.f.pageLink]) : [];
+  const ids = [...new Set(orgs.flatMap((o) => idList(o.fields[O.f.discordUserId]).filter(isSnowflake)))];
+  let sent = 0;
+  for (const id of ids) {
+    const u = await client.users.fetch(id).catch(() => null);
+    if (u) {
+      await dm(u, dmText);
+      sent++;
+    }
+  }
+  const { email, name } = leadContact(campFields);
+  const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
+  if (email && (always || !sent)) {
+    await queueRawEmail({
+      to: email,
+      kind: 'Payment',
+      subject,
+      body: `Hi ${name ? name.split(' ')[0] : 'there'},\n\n${body}${page ? `\n\n[Open your Creator Congress partner page](${page})` : ''}\n\nQuestions? Reply to the Creator Congress team.`,
+    }).catch((err) => log('email error', err));
+  }
+}
+
+async function payAlertStaff(r, reason) {
+  await staffNote(
+    `${STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}> ` : ''}⚠️ **Payment issue:** ${rowCreatorName(r)} · **${rowCampName(r)}** · ${money(rowAmount(r)) || 'amount TBD'}\n${reason}\n_Fix it in Airtable → Campaign Commitments (Payment Status), or ask the org to mark it paid again._`
+  );
+}
+
+function payButtons(rowId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`py:y:${rowId}`).setLabel('Yes, I got it').setStyle(ButtonStyle.Success).setEmoji('✅'),
+    new ButtonBuilder().setCustomId(`py:n:${rowId}`).setLabel('Not yet').setStyle(ButtonStyle.Secondary)
+  );
+}
+
+// Ask the creator to confirm (DM with buttons if on Discord; email with their page link per their email setting).
+async function askCreatorToConfirm(r, { reminder = false } = {}) {
+  const amount = money(rowAmount(r)) || 'your payment';
+  const org = first1(r.fields[K.f.orgName]) || 'The partner';
+  const note = String(r.fields[K.f.paymentNote] || '').split('\n').filter((l) => l.startsWith('Org')).pop();
+  const text =
+    `${reminder ? '⏰ Reminder: ' : ''}💸 **${org}** says they sent **${amount}** for **${rowCampName(r)}**.` +
+    (note ? `\n> ${note.replace(/^Org \([^)]*\): /, '')}` : '') +
+    `\n\nDid you receive it? If you don't answer within ${PAY.AUTO_CONFIRM_DAYS} days it will be counted as received, and you can still report a problem after that.`;
+  const did = r.fields[K.f.discordUserId];
+  if (isSnowflake(did)) {
+    const u = await client.users.fetch(did).catch(() => null);
+    await u?.send({ content: text, components: [payButtons(r.id)] }).catch(() => {});
+  }
+  const cid = first1(r.fields[K.f.creator]);
+  if (cid) {
+    const creator = await at.first(M.table, { formula: `RECORD_ID()=${at.q(cid)}`, fields: CREATOR_CONTACT_FIELDS() });
+    if (creator) {
+      await queueEmail({
+        creator,
+        kind: 'Payment check',
+        subject: `${reminder ? 'Reminder: ' : ''}Did you receive ${amount} for ${rowCampName(r)}?`,
+        body: `${hi(creator.fields)}\n\n${text.replace(/^⏰ Reminder: /, '').replace(/💸 /, '')}\n\nPlease confirm on your campaigns page. It takes one click: **Yes, I got it** or **Not yet**.${pageLine(creator.fields)}`,
+      }).catch((err) => log('email error', err));
+    }
+  }
+  await at.update(K.table, r.id, reminder
+    ? { [K.f.paymentReminders]: (Number(r.fields[K.f.paymentReminders]) || 0) + 1 }
+    : { [K.f.creatorAskedAt]: now(), [K.f.paymentReminders]: 0 });
+}
+
+// Org (or staff) marks a creator paid.
+async function markPaidByOrg(rowId, { amount, note, by }) {
+  const r = await loadPayRow(rowId);
+  if (!r || r.fields[K.f.status] !== 'Committed') return 'missing';
+  if (r.fields[K.f.paymentStatus] === 'Paid') return 'alreadypaid';
+  const amt = Number(String(amount ?? '').replace(/[$,\s]/g, ''));
+  const fields = {
+    [K.f.paymentStatus]: 'Org says paid',
+    [K.f.amountPaid]: Number.isFinite(amt) && amt > 0 ? amt : rowAmount(r) || null,
+    [K.f.orgPaidAt]: now(),
+    [K.f.orgPaidBy]: String(by || '').slice(0, 100),
+    [K.f.paymentNote]: addNote(r, 'Org', note),
+    [K.f.paymentFlagged]: false,
+  };
+  await at.update(K.table, r.id, fields);
+  Object.assign(r.fields, fields);
+  await askCreatorToConfirm(r);
+  log(`Payment marked paid by org: ${r.id}`);
+  return 'marked';
+}
+
+// Creator confirms they got paid (works whether or not the org marked it first).
+async function confirmPaidByCreator(rowId, { by = 'Creator' } = {}) {
+  const r = await loadPayRow(rowId);
+  if (!r || r.fields[K.f.status] !== 'Committed') return 'missing';
+  if (r.fields[K.f.paymentStatus] === 'Paid' && by === 'Creator' && r.fields[K.f.paidConfirmedBy] === 'Creator') return 'alreadypaid';
+  await at.update(K.table, r.id, {
+    [K.f.paymentStatus]: 'Paid',
+    [K.f.paidConfirmedAt]: now(),
+    [K.f.paidConfirmedBy]: by,
+    [K.f.amountPaid]: rowAmount(r) || null,
+    [K.f.paymentFlagged]: false,
+  });
+  log(`Payment confirmed (${by}): ${r.id}`);
+  const campFields = await campaignFieldsById(first1(r.fields[K.f.campaign]));
+  const amount = money(rowAmount(r)) || 'payment';
+  const msg = by === 'Creator'
+    ? `✅ **${rowCreatorName(r)}** confirmed they received their **${amount}** for **${rowCampName(r)}**. Thank you!`
+    : `✅ **${rowCreatorName(r)}**'s **${amount}** for **${rowCampName(r)}** is now counted as received (no reply after ${PAY.AUTO_CONFIRM_DAYS} days).`;
+  await notifyOrg(campFields, { dmText: msg, subject: `Payment confirmed: ${rowCreatorName(r)} · ${rowCampName(r)}`, body: msg.replace(/\*\*/g, '') });
+  return 'confirmedpaid';
+}
+
+// Creator says they haven't been paid. Reopens even an auto-confirmed payment.
+async function reportNotPaid(rowId, { note } = {}) {
+  const r = await loadPayRow(rowId);
+  if (!r || r.fields[K.f.status] !== 'Committed') return 'missing';
+  const st = r.fields[K.f.paymentStatus];
+  if (st === 'Paid' && r.fields[K.f.paidConfirmedBy] === 'Creator') return 'alreadypaid';
+  if (!campaignEnded(r) && st !== 'Org says paid') return 'notdue';
+  await at.update(K.table, r.id, {
+    [K.f.paymentStatus]: 'Issue',
+    [K.f.paymentNote]: addNote(r, 'Creator', note || 'Says they have not received payment yet.'),
+    [K.f.paymentFlagged]: true,
+    [K.f.paidConfirmedAt]: null,
+    [K.f.paidConfirmedBy]: null,
+  });
+  log(`Payment reported not received: ${r.id}`);
+  const campFields = await campaignFieldsById(first1(r.fields[K.f.campaign]));
+  const amount = money(rowAmount(r)) || 'their payment';
+  const msg =
+    `⚠️ **${rowCreatorName(r)}** says they haven't received **${amount}** for **${rowCampName(r)}** yet.` +
+    (note ? `\n> ${String(note).slice(0, 500)}` : '') +
+    `\n\nPlease check on it and reach out to them. Once it's sent, mark them paid again (\`/payments\` in Discord or your partner page) and they'll be asked to confirm.`;
+  await notifyOrg(campFields, { dmText: msg, subject: `Payment not received: ${rowCreatorName(r)} · ${rowCampName(r)}`, body: msg.replace(/\*\*/g, '').replace(/`/g, ''), always: true });
+  await payAlertStaff(r, `Creator reported it hasn't arrived${note ? `: "${String(note).slice(0, 300)}"` : '.'}`);
+  return 'reported';
+}
+
+// Runs from poll() every ~10 minutes: due dates, reminders, auto-confirm, overdue flags.
+let lastPayTick = 0;
+async function paymentTick() {
+  if (Date.now() - lastPayTick < PAY.TICK_MINUTES * 60_000) return;
+  lastPayTick = Date.now();
+  const rows = await at.list(K.table, {
+    formula: `AND({${K.names.status}}="Committed", {${K.names.paymentStatus}}!="Paid")`,
+    fields: PAY_FIELDS(),
+  });
+  const today = todayEt();
+  for (const r of rows) {
+    try {
+      if (!isPaidCampaignRow(r)) continue;
+      const st = r.fields[K.f.paymentStatus] || '';
+      const reminders = Number(r.fields[K.f.paymentReminders]) || 0;
+
+      if (st === 'Org says paid') {
+        const asked = r.fields[K.f.creatorAskedAt];
+        if (!asked) await askCreatorToConfirm(r); // e.g. staff or a portal set the status by hand
+        else if (daysSince(asked) >= PAY.AUTO_CONFIRM_DAYS) await confirmPaidByCreator(r.id, { by: 'Auto (14 days)' });
+        else if (daysSince(asked) >= PAY.CREATOR_REMIND_DAYS && reminders < 1) await askCreatorToConfirm(r, { reminder: true });
+        continue;
+      }
+      if (st === 'Issue') {
+        if (!r.fields[K.f.paymentFlagged]) {
+          await payAlertStaff(r, 'Marked as an issue in Airtable.');
+          await at.update(K.table, r.id, { [K.f.paymentFlagged]: true });
+        }
+        continue;
+      }
+      // Not due yet / Payment due
+      const want = campaignEnded(r) ? 'Payment due' : 'Not due yet';
+      if (st !== want) await at.update(K.table, r.id, { [K.f.paymentStatus]: want });
+      const due = r.fields[K.f.paymentDueDate];
+      if (want !== 'Payment due' || !due || due >= today) continue;
+      if (due < PAY.START) continue; // older campaigns: no overdue nagging; staff/creators can still mark them paid
+      const late = (new Date(today) - new Date(due)) / 86_400_000;
+      const campFields = await campaignFieldsById(first1(r.fields[K.f.campaign]));
+      if (reminders < 1) {
+        const msg =
+          `💸 **Payment reminder:** ${rowCreatorName(r)}'s **${money(rowAmount(r))}** for **${rowCampName(r)}** was due ${fmtDate(due)}.` +
+          `\n\nIf you've already paid, mark it paid so they can confirm (\`/payments\` in Discord or your partner page). If something's holding it up, let the creator know.`;
+        await notifyOrg(campFields, { dmText: msg, subject: `Payment due: ${rowCreatorName(r)} · ${rowCampName(r)}`, body: msg.replace(/\*\*/g, '').replace(/`/g, ''), always: true });
+        await at.update(K.table, r.id, { [K.f.paymentReminders]: 1 });
+      } else if (late >= PAY.OVERDUE_FLAG_DAYS && !r.fields[K.f.paymentFlagged]) {
+        await at.update(K.table, r.id, {
+          [K.f.paymentStatus]: 'Issue',
+          [K.f.paymentFlagged]: true,
+          [K.f.paymentNote]: addNote(r, 'Bot', `Not marked paid ${PAY.OVERDUE_FLAG_DAYS}+ days after the ${fmtDate(due)} due date.`),
+        });
+        await payAlertStaff(r, `Overdue: not marked paid ${Math.floor(late)} days after the ${fmtDate(due)} due date.`);
+      }
+    } catch (err) {
+      log('payment tick error', r.id, err);
+    }
+  }
+}
+
+// ---- Discord: creator buttons (py:y / py:n), org "Mark paid" buttons (py:m) + modals ----
+
+const PAY_RESULT_TEXT = {
+  marked: '📤 Marked paid. The creator has been asked to confirm they received it.',
+  confirmedpaid: "✅ Thanks for confirming! We've let the partner know.",
+  reported: "Thanks for letting us know. The partner and the Creator Congress team have been alerted, and someone will follow up.",
+  alreadypaid: 'This payment is already confirmed as received.',
+  notdue: "This campaign hasn't ended yet, so payment isn't due. If something's wrong, message a team member.",
+  missing: "We couldn't find that payment. It may have been withdrawn.",
+  notallowed: "You're not a contact for this campaign.",
+};
+
+async function canManagePayment(userId, r) {
+  if (await isStaff(userId)) return true;
+  const campFields = await campaignFieldsById(first1(r.fields[K.f.campaign]));
+  return (await orgContactIds(campFields?.[C.f.orgLinks])).includes(userId);
+}
+
+// Buttons answer within Discord's 3-second window: modals open immediately, checks run on submit.
+async function handlePayButton(interaction) {
+  const [, action, rowId, amountHint] = interaction.customId.split(':');
+  if (action === 'm') {
+    const modal = new ModalBuilder().setCustomId(`pym:m:${rowId}`).setTitle('Mark creator paid');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('amount').setLabel('Amount paid ($)').setStyle(TextInputStyle.Short).setRequired(true).setValue(String(amountHint || '')).setMaxLength(12)
+      ),
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('note').setLabel('Note for the creator (optional)').setPlaceholder('e.g. ACH sent 10/20, should arrive in 2-3 days').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)
+      )
+    );
+    return interaction.showModal(modal);
+  }
+  if (action === 'n') {
+    const modal = new ModalBuilder().setCustomId(`pym:n:${rowId}`).setTitle('Payment not received');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('note').setLabel('Anything we should know? (optional)').setPlaceholder('e.g. Nothing has arrived in my bank account yet').setStyle(TextInputStyle.Paragraph).setRequired(false).setMaxLength(500)
+      )
+    );
+    return interaction.showModal(modal);
+  }
+  // 'y': the creator confirms
+  const inDm = !interaction.guildId;
+  if (inDm) await interaction.deferUpdate();
+  else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const r = await loadPayRow(rowId);
+  let text;
+  if (!r) text = PAY_RESULT_TEXT.missing;
+  else if (r.fields[K.f.discordUserId] !== interaction.user.id) text = 'This payment belongs to someone else.';
+  else text = PAY_RESULT_TEXT[await confirmPaidByCreator(r.id)];
+  if (inDm) return interaction.editReply({ content: `${interaction.message.content}\n\n${text}`.slice(0, 2000), components: [] });
+  return interaction.editReply(text);
+}
+
+async function handlePayModal(interaction) {
+  const [, action, rowId] = interaction.customId.split(':');
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const r = await loadPayRow(rowId);
+  if (!r) return interaction.editReply(PAY_RESULT_TEXT.missing);
+  const note = interaction.fields.getTextInputValue('note') || '';
+  if (action === 'm') {
+    if (!(await canManagePayment(interaction.user.id, r))) return interaction.editReply(PAY_RESULT_TEXT.notallowed);
+    const amount = interaction.fields.getTextInputValue('amount');
+    const result = await markPaidByOrg(r.id, { amount, note, by: interaction.user.globalName || interaction.user.username });
+    return interaction.editReply(PAY_RESULT_TEXT[result]);
+  }
+  if (r.fields[K.f.discordUserId] !== interaction.user.id) return interaction.editReply('This payment belongs to someone else.');
+  return interaction.editReply(PAY_RESULT_TEXT[await reportNotPaid(r.id, { note })]);
+}
+
+// /payments: orgs see payment status for their confirmed creators and mark them paid. Staff see everything outstanding.
+async function handlePayments(interaction) {
+  const staff = await isStaff(interaction.user.id);
+  const orgs = await findOrgsByDiscordId(interaction.user.id);
+  if (!staff && !orgs.length) {
+    return interaction.editReply("This command is for partner organizations. Run `/link` with your organization's application email first.");
+  }
+  let rows = [];
+  if (orgs.length) {
+    const ids = [...new Set(orgs.flatMap((o) => o.fields[O.f.proposals] || []))];
+    const props = ids.length ? await listByIds(C.table, ids, [C.f.commitments]) : [];
+    const rowIds = [...new Set(props.flatMap((p) => p.fields[C.f.commitments] || []))];
+    rows = rowIds.length ? await listByIds(K.table, rowIds, PAY_FIELDS()) : [];
+  } else {
+    rows = await at.list(K.table, { formula: `AND({${K.names.status}}="Committed", {${K.names.paymentStatus}}!="Paid", {${K.names.paymentStatus}}!="Not due yet")`, fields: PAY_FIELDS() });
+  }
+  rows = rows.filter((r) => r.fields[K.f.status] === 'Committed' && isPaidCampaignRow(r));
+  if (!rows.length) return interaction.editReply('No paid campaigns with confirmed creators yet.');
+
+  const order = { Issue: 0, 'Payment due': 1, 'Org says paid': 2, 'Not due yet': 3, Paid: 4 };
+  rows.sort((a, b) => order[payStatusOf(a)] - order[payStatusOf(b)] || rowCampName(a).localeCompare(rowCampName(b)));
+  const byCamp = new Map();
+  for (const r of rows) {
+    const k = rowCampName(r);
+    if (!byCamp.has(k)) byCamp.set(k, []);
+    byCamp.get(k).push(r);
+  }
+  const count = (s) => rows.filter((r) => payStatusOf(r) === s).length;
+  const paidTotal = rows.filter((r) => payStatusOf(r) === 'Paid').reduce((t, r) => t + rowAmount(r), 0);
+  const owedTotal = rows.filter((r) => ['Payment due', 'Issue'].includes(payStatusOf(r))).reduce((t, r) => t + rowAmount(r), 0);
+  const e = new EmbedBuilder()
+    .setAuthor({ name: staff && !orgs.length ? 'CREATOR CONGRESS · OUTSTANDING PAYMENTS' : 'CREATOR CONGRESS · PARTNER PAYMENTS' })
+    .setTitle('💸 Creator payments')
+    .setColor(0xf1c40f)
+    .setDescription(
+      [
+        `✅ **${count('Paid')}** paid${paidTotal ? ` (${money(paidTotal)})` : ''}`,
+        `📤 **${count('Org says paid')}** waiting on creator`,
+        `💸 **${count('Payment due')}** due${owedTotal ? ` (${money(owedTotal)} incl. issues)` : ''}`,
+        count('Issue') ? `⚠️ **${count('Issue')}** issue${count('Issue') === 1 ? '' : 's'}` : null,
+        count('Not due yet') ? `⏳ **${count('Not due yet')}** not due yet` : null,
+      ].filter(Boolean).join('   ·   ')
+    );
+  let budget = 5200;
+  for (const [camp, list] of [...byCamp].slice(0, 20)) {
+    let value = list
+      .map((r) => {
+        const st = payStatusOf(r);
+        const due = r.fields[K.f.paymentDueDate];
+        const extra = st === 'Payment due' && due ? ` · due ${fmtDate(due)}` : st === 'Org says paid' ? ' · waiting on creator' : '';
+        const who = isSnowflake(r.fields[K.f.discordUserId]) ? ` <@${r.fields[K.f.discordUserId]}>` : '';
+        return `${PAY_EMOJI[st]} ${rowCreatorName(r)}${who} · ${money(rowAmount(r))}${extra}`;
+      })
+      .join('\n');
+    if (value.length > 1000) value = value.slice(0, value.lastIndexOf('\n', 990)) + '\n…and more (see your partner page)';
+    if (camp.length + value.length > budget) break;
+    budget -= camp.length + value.length;
+    e.addFields({ name: camp.slice(0, 256), value });
+  }
+  const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
+  e.setFooter({ text: 'Paid = the creator confirmed it (or no reply 14 days after you marked it). Only you can see this.' });
+  const actionable = rows.filter((r) => ['Payment due', 'Issue', 'Not due yet'].includes(payStatusOf(r))).slice(0, 20);
+  const components = [];
+  for (let i = 0; i < actionable.length; i += 4) {
+    components.push(
+      new ActionRowBuilder().addComponents(
+        actionable.slice(i, i + 4).map((r) =>
+          new ButtonBuilder().setCustomId(`py:m:${r.id}:${Math.round(rowAmount(r) * 100) / 100 || ''}`).setLabel(`Mark paid: ${rowCreatorName(r)}`.slice(0, 80)).setStyle(ButtonStyle.Primary)
+        )
+      )
+    );
+  }
+  if (page && components.length < 5) {
+    components.push(new ActionRowBuilder().addComponents(new ButtonBuilder().setStyle(ButtonStyle.Link).setURL(page).setLabel('Open partner page')));
+  }
+  return interaction.editReply({ embeds: [e], components: components.slice(0, 5) });
+}
+
+// ---- partner (org) web page: /o/<token> ----
+
+async function ensureOrgTokens() {
+  if (!PUBLIC_URL) return;
+  const rows = await at.list(O.table, { formula: `AND({${O.names.approved}}, {${O.names.pageToken}}="")`, fields: [O.f.organization], maxRecords: 50 });
+  for (const r of rows) {
+    const token = randomBytes(16).toString('hex');
+    await at.update(O.table, r.id, { [O.f.pageToken]: token, [O.f.pageLink]: `${publicBase()}/o/${token}` });
+  }
+  if (rows.length) log(`Issued partner-page links to ${rows.length} org(s)`);
+}
+
+async function orgByToken(token) {
+  if (!/^[a-f0-9]{32}$/.test(token)) return null;
+  return at.first(O.table, {
+    formula: `{${O.names.pageToken}}=${at.q(token)}`,
+    fields: [O.f.organization, O.f.firstName, O.f.proposals, O.f.approved],
+  });
+}
+
+const ORG_FLASH = {
+  marked: '📤 Marked paid. The creator has been asked to confirm they received it.',
+  alreadypaid: 'That creator already confirmed they were paid.',
+  missing: "We couldn't find that creator on your campaigns.",
+};
+
+async function renderOrgPage(org, token, flash) {
+  const ids = org.fields[O.f.proposals] || [];
+  const props = ids.length ? await listByIds(C.table, ids, Object.values(C.f)) : [];
+  const rowIds = [...new Set(props.flatMap((p) => p.fields[C.f.commitments] || []))];
+  const rows = (rowIds.length ? await listByIds(K.table, rowIds, PAY_FIELDS()) : []).filter((r) => r.fields[K.f.status] === 'Committed');
+  props.sort((a, b) => (b.fields[C.f.status] === C.ACTIVE) - (a.fields[C.f.status] === C.ACTIVE));
+  const paidRows = rows.filter((r) => isPaidCampaignRow(r));
+  const tot = (s) => paidRows.filter((r) => payStatusOf(r) === s).reduce((t, r) => t + rowAmount(r), 0);
+  const cnt = (s) => paidRows.filter((r) => payStatusOf(r) === s).length;
+
+  const campHtml = props
+    .map((p) => {
+      const mine = rows.filter((r) => first1(r.fields[K.f.campaign]) === p.id);
+      if (!mine.length && p.fields[C.f.status] !== C.ACTIVE) return '';
+      const f = p.fields;
+      const list = mine.length
+        ? mine
+            .map((r) => {
+              const st = payStatusOf(r);
+              const paid = isPaidCampaignRow(r);
+              const email = first1(r.fields[K.f.creatorEmail]);
+              const note = String(r.fields[K.f.paymentNote] || '').trim();
+              const canMark = paid && ['Not due yet', 'Payment due', 'Issue'].includes(st);
+              const due = r.fields[K.f.paymentDueDate];
+              return `<div class="row">
+  <div class="row-main"><b>${esc(rowCreatorName(r))}</b>${email ? ` · <a href="mailto:${esc(email)}?subject=${encodeURIComponent(f[C.f.shortName] || 'Creator Congress')}">${esc(email)}</a>` : ''}
+    ${paid ? `<div class="paystat ${st.replace(/\W+/g, '').toLowerCase()}">${esc(PAY_LABEL[st])} · ${esc(money(rowAmount(r)))}${st === 'Payment due' && due ? ` · due ${esc(fmtDate(due))}` : ''}${st === 'Org says paid' ? ' · waiting for the creator to confirm' : ''}</div>` : '<div class="muted">Unpaid campaign</div>'}
+    ${note ? `<details><summary>Payment notes</summary><p>${esc(note)}</p></details>` : ''}
+  </div>
+  ${canMark ? `<form method="post" action="/o/${token}/paid/${r.id}" class="markpaid">
+    <label>Amount <input name="amount" inputmode="decimal" value="${esc(String(rowAmount(r) || ''))}" size="7"></label>
+    <input name="note" placeholder="Note for the creator (optional)" maxlength="500">
+    <button class="primary">Mark paid</button></form>` : ''}
+</div>`;
+            })
+            .join('')
+        : '<p class="empty">No confirmed creators yet.</p>';
+      return `<div class="card"><h3>${esc(f[C.f.shortName] || 'Campaign')}</h3>
+  <div class="meta"><span>${f[C.f.status] === C.ACTIVE ? '🟢 Active' : '⚪ Closed'}</span><span>💰 ${f[C.f.creatorPay] ? esc(money(Number(f[C.f.creatorPay]))) + ' per creator' : 'Unpaid / TBD'}</span>${f[C.f.endDate] ? `<span>📅 ends ${esc(fmtDate(f[C.f.endDate]))}</span>` : ''}<span>👥 ${mine.length} confirmed</span></div>
+  ${list}</div>`;
+    })
+    .join('');
+
+  const body = `
+<header><div class="brand">Creator Congress · Partner page</div><h1>${esc(org.fields[O.f.organization] || 'Your organization')}</h1>
+<p>Your confirmed creators, how to reach them, and where each payment stands.</p></header>
+${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>` : ''}
+<div class="stats">
+  <div class="stat"><b>${cnt('Paid')}</b>paid${tot('Paid') ? ` · ${esc(money(tot('Paid')))}` : ''}</div>
+  <div class="stat"><b>${cnt('Org says paid')}</b>waiting on creator</div>
+  <div class="stat"><b>${cnt('Payment due') + cnt('Issue')}</b>to pay${tot('Payment due') + tot('Issue') ? ` · ${esc(money(tot('Payment due') + tot('Issue')))}` : ''}</div>
+</div>
+<div class="flash">How payment confirmation works: after you pay a creator, click <b>Mark paid</b>. They're asked to confirm it arrived. It shows as <b>✅ Paid</b> once they confirm, or automatically if they don't reply within 14 days. Payments are due within 30 days of the campaign's end date.</div>
+${campHtml || '<p class="empty">No campaigns yet.</p>'}
+<footer>This page is private to your organization, so please don't share the link outside your team. Questions? Reply to any Creator Congress email.</footer>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Partner page · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
+}
+
+// Read a small urlencoded form body.
+function readForm(req) {
+  return new Promise((resolve) => {
+    let data = '';
+    req.on('data', (c) => {
+      data += c;
+      if (data.length > 10_000) req.destroy();
+    });
+    req.on('end', () => resolve(Object.fromEntries(new URLSearchParams(data))));
+    req.on('error', () => resolve({}));
+  });
+}
+
+// Creator page: payment line + buttons for a confirmed, paid campaign row.
+function paymentHtml(r, token) {
+  if (!r || !isPaidCampaignRow(r)) return '';
+  const st = payStatusOf(r);
+  const amount = money(rowAmount(r));
+  const due = r.fields[K.f.paymentDueDate];
+  const orgNote = String(r.fields[K.f.paymentNote] || '').split('\n').filter((l) => l.startsWith('Org')).pop();
+  const yes = `<form method="post" action="/c/${token}/pay/${r.id}/yes"><button class="primary">✅ Yes, I got paid</button></form>`;
+  const no = `<details class="notpaid"><summary>I haven't been paid</summary><form method="post" action="/c/${token}/pay/${r.id}/no"><textarea name="note" rows="2" maxlength="500" placeholder="Anything we should know? (optional)"></textarea><button>Report it</button></form></details>`;
+  const lines = {
+    'Not due yet': `Payment is due within 30 days after the campaign ends${due ? ` (by ${esc(fmtDate(due))})` : ''}.`,
+    'Payment due': `The campaign has ended. Payment is due${due ? ` by ${esc(fmtDate(due))}` : ''}. Already received it? Let us know.`,
+    'Org says paid': `<b>The partner says they sent ${esc(amount)}.</b> Did it arrive?${orgNote ? `<br><span class="muted">${esc(orgNote.replace(/^Org \([^)]*\): /, ''))}</span>` : ''}`,
+    Paid: r.fields[K.f.paidConfirmedBy] === 'Creator' ? `You confirmed you received ${esc(amount)}. Thank you!` : `Counted as received. Not right? Let us know.`,
+    Issue: 'You reported a problem with this payment. The partner and our team have been alerted.',
+  };
+  let actions = '';
+  if (st === 'Org says paid' || st === 'Payment due') actions = yes + no;
+  else if (st === 'Paid' && r.fields[K.f.paidConfirmedBy] !== 'Creator') actions = no;
+  else if (st === 'Issue') actions = yes;
+  return `<div class="pay ${st.replace(/\W+/g, '').toLowerCase()}"><div class="contact-h">Payment · ${esc(PAY_LABEL[st])}${amount ? ` · ${esc(amount)}` : ''}</div><p>${lines[st]}</p>${actions ? `<div class="actions">${actions}</div>` : ''}</div>`;
+}
+
 // ---------- slash commands ----------
 
 const commands = [
@@ -1651,6 +2492,7 @@ const commands = [
   new SlashCommandBuilder().setName('roster').setDescription('For organizations: see which creators signed up for your campaigns'),
   new SlashCommandBuilder().setName('review').setDescription('For organizations: approve or decline creators who asked to join your campaigns'),
   new SlashCommandBuilder().setName('invite').setDescription('For organizations: pick suggested creators to invite to your invite-only campaigns'),
+  new SlashCommandBuilder().setName('payments').setDescription('For organizations: see payment status for your creators and mark them paid'),
   new SlashCommandBuilder().setName('help').setDescription('How Creator Congress campaigns work'),
 ].map((c) => c.toJSON());
 
@@ -1735,7 +2577,7 @@ async function handleLink(interaction) {
 async function handleMyCampaigns(interaction) {
   let rows = await at.list(K.table, {
     formula: `AND({${K.names.discordUserId}}=${at.q(interaction.user.id)}, OR({${K.names.status}}="Committed", {${K.names.status}}="Pending", {${K.names.status}}="Invited"))`,
-    fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay, K.f.orgName, K.f.status],
+    fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay, K.f.orgName, K.f.status, K.f.leadContact, K.f.paymentDetails, K.f.paymentStatus, K.f.amountPaid, K.f.paidConfirmedBy, K.f.paymentDueDate],
   });
   const awaiting = rows.filter((r) => r.fields[K.f.status] === 'Pending' && (Array.isArray(r.fields[K.f.campaignStatus]) ? r.fields[K.f.campaignStatus][0] : r.fields[K.f.campaignStatus]) === C.ACTIVE);
   const invitations = rows.filter((r) => r.fields[K.f.status] === 'Invited' && (Array.isArray(r.fields[K.f.campaignStatus]) ? r.fields[K.f.campaignStatus][0] : r.fields[K.f.campaignStatus]) === C.ACTIVE);
@@ -1756,7 +2598,11 @@ async function handleMyCampaigns(interaction) {
     const link = `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${key}`;
     const details = [pay(r) ? money(pay(r)) : null, org, end ? `${isActive ? 'ends' : 'ended'} ${end}` : null].filter(Boolean);
     const title = isInviteKey(key) ? `**${name}** ✉️` : `**[${name}](${link})**`;
-    return `${title}${details.length ? `\n╰ ${details.join(' · ')}` : ''}`;
+    const contact = r.fields[K.f.status] === 'Committed' ? String(first(r.fields[K.f.leadContact]) || '').trim() : '';
+    const hasPay = r.fields[K.f.status] === 'Committed' && String(first(r.fields[K.f.paymentDetails]) || '').trim();
+    const contactLine = contact ? `\n╰ 🤝 ${contact}${hasPay ? ' · 💸 payment details posted' : ''}` : '';
+    const payLine = r.fields[K.f.status] === 'Committed' && isPaidCampaignRow(r) ? `\n╰ ${PAY_LABEL[payStatusOf(r)]}${payStatusOf(r) === 'Org says paid' ? ': please confirm below' : ''}` : '';
+    return `${title}${details.length ? `\n╰ ${details.join(' · ')}` : ''}${payLine}${contactLine}`;
   };
   const active = rows.filter((r) => first(r.fields[K.f.campaignStatus]) === C.ACTIVE);
   const past = rows.filter((r) => first(r.fields[K.f.campaignStatus]) !== C.ACTIVE);
@@ -1771,8 +2617,10 @@ async function handleMyCampaigns(interaction) {
     return out;
   };
 
+  const paidSoFar = rows.filter((r) => r.fields[K.f.paymentStatus] === 'Paid').reduce((t, r) => t + rowAmount(r), 0);
   const summary = [
     sum(rows) ? `💰 **${money(sum(rows))}** expected` : null,
+    paidSoFar ? `✅ **${money(paidSoFar)}** paid so far` : null,
     `🟢 **${active.length}** active`,
     `⚪ **${past.length}** past`,
     awaiting.length ? `⏳ **${awaiting.length}** awaiting approval` : null,
@@ -1801,6 +2649,7 @@ async function handleMyCampaigns(interaction) {
   if (unlinked) notes.push('Run /link with your application email to connect these to your profile.');
   if (PORTAL_URL) notes.push(`Also on your member portal: ${PORTAL_URL}`);
   e.setFooter({ text: notes.length ? notes.join(' · ') : 'Only you can see this.' });
+  const toConfirm = rows.filter((r) => isPaidCampaignRow(r) && ['Org says paid', 'Payment due'].includes(payStatusOf(r)));
   const components = invitations.slice(0, 5).map((r) => {
     const nm = String((Array.isArray(r.fields[K.f.campaignName]) ? r.fields[K.f.campaignName][0] : r.fields[K.f.campaignName]) || 'invite').slice(0, 40);
     return new ActionRowBuilder().addComponents(
@@ -1808,6 +2657,15 @@ async function handleMyCampaigns(interaction) {
       new ButtonBuilder().setCustomId(`iv:d:${r.id}`).setLabel('No thanks').setStyle(ButtonStyle.Secondary)
     );
   });
+  for (const r of toConfirm.slice(0, 5 - components.length)) {
+    const nm = String(first(r.fields[K.f.campaignName]) || 'campaign').slice(0, 40);
+    components.push(
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`py:y:${r.id}`).setLabel(`I got paid: ${nm}`.slice(0, 80)).setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`py:n:${r.id}`).setLabel('Not yet').setStyle(ButtonStyle.Secondary)
+      )
+    );
+  }
   return interaction.editReply({ embeds: [e], components });
 }
 
@@ -1842,7 +2700,7 @@ async function handleRoster(interaction) {
     const chunk = messageIds.slice(i, i + 40);
     const rows = await at.list(K.table, {
       formula: `AND(OR({${K.names.status}}="Committed", {${K.names.status}}="Pending", {${K.names.status}}="Invited", {${K.names.status}}="Declined invite"), OR(${chunk.map((m) => `{${K.names.discordMessageId}}=${at.q(m)}`).join(',')}))`,
-      fields: [K.f.creatorName, K.f.discordUserId, K.f.discordUsername, K.f.discordMessageId, K.f.status],
+      fields: [K.f.creatorName, K.f.discordUserId, K.f.discordUsername, K.f.discordMessageId, K.f.status, K.f.paymentStatus, K.f.campaignPay, K.f.amountPaid, K.f.campaignEndDate, K.f.campaignStatus],
     });
     for (const r of rows) {
       if (r.fields[K.f.status] === 'Invited' || r.fields[K.f.status] === 'Declined invite') {
@@ -1899,7 +2757,8 @@ async function handleRoster(interaction) {
       list = rows
         .map((r) => {
           const nm = (r.fields[K.f.creatorName] || [])[0] || r.fields[K.f.discordUsername] || 'Creator';
-          return `› ${nm} · <@${r.fields[K.f.discordUserId]}>`;
+          const payMark = isPaidCampaignRow(r) && payStatusOf(r) !== 'Not due yet' ? ` · ${PAY_EMOJI[payStatusOf(r)]}` : '';
+          return `› ${nm}${isSnowflake(r.fields[K.f.discordUserId]) ? ` · <@${r.fields[K.f.discordUserId]}>` : ''}${payMark}`;
         })
         .join('\n');
       if (list.length > 800) list = list.slice(0, list.lastIndexOf('\n', 790)) + '\n› …and more (see Airtable)';
@@ -1923,7 +2782,7 @@ async function handleRoster(interaction) {
     shown.push(p);
   }
   e.setFooter({
-    text: (proposals.length > shown.length ? `Showing ${shown.length} of ${proposals.length} campaigns · ` : '') + 'Only you can see this.',
+    text: (proposals.length > shown.length ? `Showing ${shown.length} of ${proposals.length} campaigns · ` : '') + 'Payments: 💸 due · 📤 waiting on creator · ✅ paid · ⚠️ issue. Use /payments to mark creators paid. Only you can see this.',
   });
   return interaction.editReply({ embeds: [e] });
 }
@@ -1940,7 +2799,8 @@ async function handleHelp(interaction) {
       { name: '3️⃣  Track your campaigns', value: 'Type `/mycampaigns` to see what you joined and your expected pay (an estimate, not a confirmed payment).' },
       { name: '🙋  Partner-reviewed campaigns', value: 'Some campaigns are reviewed by the partner. Your ✅ is a request, and you get a DM once you’re confirmed.' },
       { name: '✉️  Invitations', value: 'Some campaigns are invite-only. If you’re invited, you’ll get a DM with Accept / No thanks buttons (also in `/mycampaigns`).' },
-      { name: '🏢  Partner organizations', value: '`/link` with your organization’s application email, `/roster` to see who signed up, and `/review` to approve or decline requests, `/invite` to pick suggested creators for invite-only campaigns.' },
+      { name: '💸  Getting paid', value: 'Your contact and payment details appear once you’re confirmed. After a partner marks you paid, you’ll get a DM to confirm it arrived. A payment only counts as **Paid** once you confirm it (or 14 days pass with no reply). Not paid? Tap **Not yet** and we’ll follow up.' },
+      { name: '🏢  Partner organizations', value: '`/link` with your organization’s application email, `/roster` to see who signed up, `/review` to approve or decline requests, `/invite` to pick suggested creators, and `/payments` to mark creators paid. Payments are due within 30 days of the campaign’s end.' },
       { name: '🔒  Good to know', value: 'Reactions are public. Command replies are private to you. Closed campaigns don’t take sign-ups.' }
     )
     .setFooter({ text: 'Questions? Message a Creator Congress team member.' });
@@ -1949,6 +2809,26 @@ async function handleHelp(interaction) {
 }
 
 client.on('interactionCreate', async (interaction) => {
+  if (interaction.isButton() && interaction.customId.startsWith('py:')) {
+    try {
+      await handlePayButton(interaction);
+    } catch (err) {
+      log('payment button error', err);
+      const msg = { content: 'Something went wrong on our end. Please try again in a minute.', flags: MessageFlags.Ephemeral };
+      (interaction.replied || interaction.deferred ? interaction.followUp(msg) : interaction.reply(msg)).catch(() => {});
+    }
+    return;
+  }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('pym:')) {
+    try {
+      await handlePayModal(interaction);
+    } catch (err) {
+      log('payment modal error', err);
+      const msg = 'Something went wrong on our end. Please try again in a minute.';
+      (interaction.deferred ? interaction.editReply(msg) : interaction.reply({ content: msg, flags: MessageFlags.Ephemeral })).catch(() => {});
+    }
+    return;
+  }
   if (interaction.isButton() && /^(rv|iv|sg):/.test(interaction.customId)) {
     try {
       const kind = interaction.customId.slice(0, 2);
@@ -1971,6 +2851,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'help') await handleHelp(interaction);
     if (interaction.commandName === 'review') await handleReview(interaction);
     if (interaction.commandName === 'invite') await handleInviteCommand(interaction);
+    if (interaction.commandName === 'payments') await handlePayments(interaction);
   } catch (err) {
     log('command error', err);
     const msg = 'Something went wrong on our end. Please try again in a minute.';
@@ -1992,6 +2873,9 @@ async function poll() {
     await checkStaleRequests();
     await remindInvites();
     await maybeSendWeeklyDigest();
+    await ensureOrgTokens();
+    await sweepCampaignThreads();
+    await paymentTick();
     log('Checked Airtable for campaigns to post/close');
   } catch (err) {
     log('poll error', err);
