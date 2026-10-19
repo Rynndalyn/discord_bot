@@ -406,6 +406,8 @@ async function missingBotPerms(guild) {
   return NEEDED_PERMS.filter((p) => !me.permissions.has(PermissionFlagsBits[p]));
 }
 
+const welcomedToThread = new Set(); // `${threadId}:${userId}` already pinged this run
+
 async function doSyncCampaignThread(rec) {
   const f = rec.fields;
   if (!f[C.f.discordMessageId]) return;
@@ -475,12 +477,19 @@ async function doSyncCampaignThread(rec) {
 
   const want = new Set([...(await committedDiscordIds(f)), ...orgIds]);
   const current = await thread.members.fetch().catch(() => new Map());
+  for (const id of current.keys()) welcomedToThread.add(`${thread.id}:${id}`);
   const newcomers = [];
   for (const id of want) {
     if (current.has(id)) continue;
     try {
       await thread.members.add(id);
-      newcomers.push(id);
+      // Discord's member list can lag a few seconds, so a back-to-back sync may "add" someone twice.
+      // Only welcome each person once per thread.
+      const key = `${thread.id}:${id}`;
+      if (!welcomedToThread.has(key)) {
+        welcomedToThread.add(key);
+        newcomers.push(id);
+      }
     } catch (err) {
       log(`Couldn't add ${id} to thread ${thread.id}: ${err.message}`);
     }
