@@ -1194,6 +1194,58 @@ async function handleInviteButton(interaction) {
 }
 
 // Org (or staff) picks from the bot's suggestions in Discord.
+// ---- creator directory (orgs browse and invite anyone, not just suggestions) ----
+// Profile only, never contact info: email appears only after a creator accepts.
+let creatorDir = { at: 0, list: [] };
+async function creatorDirectory() {
+  if (Date.now() - creatorDir.at < 10 * 60_000 && creatorDir.list.length) return creatorDir.list;
+  const rows = await at.list(M.table, {
+    formula: `{${M.names.approved}}`,
+    fields: [M.f.fullName, M.f.reach, M.f.tiktok, M.f.instagram, M.f.youtube, M.f.issues, M.f.about, M.f.state],
+  });
+  creatorDir = { at: Date.now(), list: rows.filter((r) => String(r.fields[M.f.fullName] || '').trim()) };
+  return creatorDir.list;
+}
+function searchCreators(list, { q = '', issue = '', state = '', min = 0 } = {}) {
+  const needle = String(q).trim().toLowerCase();
+  const handles = (f) => [f[M.f.tiktok], f[M.f.instagram], f[M.f.youtube]].filter(Boolean).join(' ').toLowerCase();
+  return list
+    .filter((c) => {
+      const f = c.fields;
+      if (needle && !String(f[M.f.fullName] || '').toLowerCase().includes(needle) && !handles(f).includes(needle)) return false;
+      if (issue && !(f[M.f.issues] || []).includes(issue)) return false;
+      if (state && f[M.f.state] !== state) return false;
+      if (min && !(Number(f[M.f.reach]) >= min)) return false;
+      return true;
+    })
+    .sort((a, b) => (Number(b.fields[M.f.reach]) || 0) - (Number(a.fields[M.f.reach]) || 0));
+}
+const reachShort = (n) => (!Number(n) ? '' : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+
+// Who may search the directory in Discord (cached so autocomplete answers in time).
+const searchAccess = new Map();
+async function canSearchCreators(userId) {
+  const hit = searchAccess.get(userId);
+  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.ok;
+  const ok = (await isStaff(userId)) || (await findOrgsByDiscordId(userId)).length > 0;
+  searchAccess.set(userId, { ok, at: Date.now() });
+  return ok;
+}
+
+async function handleInviteAutocomplete(interaction) {
+  const focused = interaction.options.getFocused();
+  if (!(await canSearchCreators(interaction.user.id))) return interaction.respond([]);
+  const list = await creatorDirectory();
+  const results = searchCreators(list, { q: focused }).slice(0, 25);
+  return interaction.respond(
+    results.map((c) => {
+      const f = c.fields;
+      const label = [f[M.f.fullName], f[M.f.state], reachShort(Number(f[M.f.reach])) && `${reachShort(Number(f[M.f.reach]))} followers`].filter(Boolean).join(' · ');
+      return { name: label.slice(0, 100), value: c.id };
+    })
+  );
+}
+
 async function handleInviteCommand(interaction) {
   const staff = await isStaff(interaction.user.id);
   const orgs = await findOrgsByDiscordId(interaction.user.id);
@@ -1212,6 +1264,30 @@ async function handleInviteCommand(interaction) {
   }
   if (!campaigns.length) return interaction.editReply('You don’t have any active invite-only campaigns. Ask the Creator Congress team to set one up.');
 
+  // Picked a specific creator from the search box
+  const chosen = interaction.options.getString('creator');
+  if (chosen) {
+    if (!/^rec[A-Za-z0-9]{14}$/.test(chosen)) return interaction.editReply('Pick a creator from the list that appears as you type their name.');
+    const c = (await listByIds(M.table, [chosen], [M.f.fullName, M.f.reach, M.f.tiktok, M.f.instagram, M.f.youtube, M.f.issues, M.f.about, M.f.state, M.f.approved]))[0];
+    if (!c || !c.fields[M.f.approved]) return interaction.editReply('That creator isn’t in the approved Creator Congress network.');
+    const nm = c.fields[M.f.fullName] || 'Creator';
+    const { embed } = buildReviewCard({ req: { id: c.id, fields: { [K.f.discordUsername]: nm } }, camp: campaigns[0], creator: c }, { banner: '🔎  CREATOR YOU PICKED' });
+    embed.setTitle(nm.slice(0, 256)).setColor(0x9b59b6).setFooter({ text: 'Choose which campaign to invite them to.' });
+    const open = campaigns.filter((p) => !(p.fields[C.f.invited] || []).includes(c.id));
+    if (!open.length) return interaction.editReply({ content: `**${nm}** is already invited to all of your invite-only campaigns.`, embeds: [embed] });
+    const rows = [];
+    for (let i = 0; i < open.slice(0, 20).length; i += 4) {
+      rows.push(
+        new ActionRowBuilder().addComponents(
+          open.slice(i, i + 4).map((p) =>
+            new ButtonBuilder().setCustomId(`sg:i:${p.id}:${c.id}`).setLabel(`Invite to ${p.fields[C.f.shortName] || 'campaign'}`.slice(0, 80)).setStyle(ButtonStyle.Primary).setEmoji('✉️')
+          )
+        )
+      );
+    }
+    return interaction.editReply({ embeds: [embed], components: rows.slice(0, 5) });
+  }
+
   const picks = [];
   for (const p of campaigns) {
     const invited = new Set(p.fields[C.f.invited] || []);
@@ -1219,7 +1295,7 @@ async function handleInviteCommand(interaction) {
   }
   if (!picks.length) {
     const names = campaigns.map((p) => `**${p.fields[C.f.shortName]}** (${(p.fields[C.f.invited] || []).length} invited)`).join(', ');
-    return interaction.editReply(`No new suggestions right now for ${names}. Use \`/roster\` to see who has responded.`);
+    return interaction.editReply(`No new suggestions right now for ${names}. To invite someone specific, run \`/invite creator:\` and start typing their name. Use \`/roster\` to see who has responded.`);
   }
   const shown = picks.slice(0, 5);
   const creators = await listByIds(M.table, [...new Set(shown.map((x) => x.id))], [M.f.fullName, M.f.reach, M.f.tiktok, M.f.instagram, M.f.youtube, M.f.issues, M.f.about, M.f.state]);
@@ -1246,7 +1322,7 @@ async function handleInviteCommand(interaction) {
     );
   }
   return interaction.editReply({
-    content: `**${picks.length}** suggested creator${picks.length === 1 ? '' : 's'} to consider, best matches first.${picks.length > 5 ? ' Showing 5. Run `/invite` again for more.' : ''}`,
+    content: `**${picks.length}** suggested creator${picks.length === 1 ? '' : 's'} to consider, best matches first.${picks.length > 5 ? ' Showing 5. Run `/invite` again for more.' : ''}\nWant someone else? Run \`/invite creator:\` and start typing their name.`,
     embeds,
     components,
   });
@@ -1737,6 +1813,7 @@ textarea,input{font:inherit;border:1px solid var(--line);border-radius:8px;paddi
 .row{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
 .row-main{flex:1 1 260px;min-width:0}.row-main a{color:var(--accent);word-break:break-all}
 .paystat{font-size:14px;margin-top:2px}.paystat.paid{color:var(--ok)}.paystat.issue{color:#b42318}.paystat.paymentdue{color:var(--warn)}
+.findform{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.findform input{flex:1 1 180px}select{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--ink);max-width:100%}
 .markpaid{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.markpaid label{font-size:14px;color:var(--muted)}.markpaid input[name=note]{flex:1 1 180px}
 `;
 
@@ -1869,11 +1946,20 @@ function startWebServer() {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
       // Partner (org) page
-      const om = url.pathname.match(/^\/o\/([a-f0-9]{32})(?:\/paid\/(rec[A-Za-z0-9]{14})|\/review\/(rec[A-Za-z0-9]{14})\/(approve|decline)|\/(invite|skip)\/(rec[A-Za-z0-9]{14})\/(rec[A-Za-z0-9]{14}))?\/?$/);
+      const om = url.pathname.match(/^\/o\/([a-f0-9]{32})(?:\/paid\/(rec[A-Za-z0-9]{14})|\/review\/(rec[A-Za-z0-9]{14})\/(approve|decline)|\/(invite|skip)\/(rec[A-Za-z0-9]{14})\/(rec[A-Za-z0-9]{14})|\/invitepick\/(rec[A-Za-z0-9]{14}))?\/?$/);
       if (om) {
-        const [, otoken, payRowId, reviewRowId, decision, inviteVerb, invCampId, invCreatorId] = om;
+        let [, otoken, payRowId, reviewRowId, decision, inviteVerb, invCampId, invCreatorId, pickCreatorId] = om;
         const org = await orgByToken(otoken);
         if (!org || !org.fields[O.f.approved]) return send(res, 404, simple('Link not recognized', 'This link may have expired. Contact the Creator Congress team for a new one.'));
+        if (req.method === 'POST' && pickCreatorId) {
+          const form = await readForm(req);
+          inviteVerb = 'invite';
+          invCampId = String(form.camp || '');
+          invCreatorId = pickCreatorId;
+          if (!/^rec[A-Za-z0-9]{14}$/.test(invCampId)) invCampId = '';
+          const dir = await creatorDirectory();
+          if (!dir.some((c) => c.id === invCreatorId)) invCampId = ''; // only approved creators
+        }
         if (req.method === 'POST' && (reviewRowId || inviteVerb)) {
           const ids = org.fields[O.f.proposals] || [];
           const props = ids.length ? await listByIds(C.table, ids, [C.f.commitments]) : [];
@@ -1885,7 +1971,7 @@ function startWebServer() {
               await applyDecision(data.req, data.camp, decision === 'approve', orgName);
               result = decision === 'approve' ? 'approved' : 'declined';
             } else result = 'decided';
-          } else if (inviteVerb && ids.includes(invCampId)) {
+          } else if (inviteVerb && invCampId && ids.includes(invCampId)) {
             const p = await at.first(C.table, { formula: `RECORD_ID()=${at.q(invCampId)}`, fields: [C.f.suggested, C.f.invited] });
             if (p) {
               const suggested = (p.fields[C.f.suggested] || []).filter((x) => x !== invCreatorId);
@@ -1908,7 +1994,7 @@ function startWebServer() {
           return res.end();
         }
         if (req.method !== 'GET') return send(res, 405, simple('Not allowed', ''));
-        return send(res, 200, await renderOrgPage(org, otoken, url.searchParams.get('done')));
+        return send(res, 200, await renderOrgPage(org, otoken, url.searchParams.get('done'), { query: Object.fromEntries(url.searchParams) }));
       }
       // Creator: confirm or report a payment
       const pm = url.pathname.match(/^\/c\/([a-f0-9]{32})\/pay\/(rec[A-Za-z0-9]{14})\/(yes|no)\/?$/);
@@ -2529,7 +2615,7 @@ const ORG_FLASH = {
   missing: "We couldn't find that creator on your campaigns.",
 };
 
-async function renderOrgPage(org, token, flash) {
+async function renderOrgPage(org, token, flash, opts = {}) {
   const ids = org.fields[O.f.proposals] || [];
   const props = ids.length ? await listByIds(C.table, ids, Object.values(C.f)) : [];
   const rowIds = [...new Set(props.flatMap((p) => p.fields[C.f.commitments] || []))];
@@ -2544,7 +2630,7 @@ async function renderOrgPage(org, token, flash) {
   const pending = allRows.filter((r) => r.fields[K.f.status] === 'Pending');
   const inviteCamps = props.filter((p) => p.fields[C.f.status] === C.ACTIVE && modeOf(p.fields) === 'invite');
   const profileIds = new Set(pending.map((r) => first1(r.fields[K.f.creator])).filter(Boolean));
-  for (const p of inviteCamps) for (const id of p.fields[C.f.suggested] || []) profileIds.add(id);
+  for (const p of inviteCamps) for (const id of [...(p.fields[C.f.suggested] || []), ...(p.fields[C.f.invited] || [])]) profileIds.add(id);
   const profiles = new Map(
     (profileIds.size
       ? await listByIds(M.table, [...profileIds], [M.f.fullName, M.f.reach, M.f.tiktok, M.f.instagram, M.f.youtube, M.f.issues, M.f.about, M.f.state])
@@ -2574,6 +2660,37 @@ async function renderOrgPage(org, token, flash) {
         .join('') +
       `<p class="muted">Declined creators get a kind note. No reason is shared. Requests waiting 7+ days are flagged to the Creator Congress team.</p>`
     : '';
+  // Find any creator (search form) for invite-only campaigns
+  let findHtml = '';
+  if (inviteCamps.length) {
+    const dir = await creatorDirectory();
+    const qp = opts.query || {};
+    const crit = { q: qp.q || '', issue: qp.issue || '', state: qp.state || '', min: Number(qp.min) || 0 };
+    const searching = crit.q || crit.issue || crit.state || crit.min;
+    const issuesAll = [...new Set(dir.flatMap((c) => c.fields[M.f.issues] || []))].sort();
+    const statesAll = [...new Set(dir.map((c) => c.fields[M.f.state]).filter(Boolean))].sort();
+    const opt = (v, cur) => `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(v)}</option>`;
+    const results = searching ? searchCreators(dir, crit) : [];
+    const invitedTo = (cid) => inviteCamps.filter((p) => (p.fields[C.f.invited] || []).includes(cid));
+    findHtml = `<h2 id="find">🔎 Find creators</h2>
+  <p class="muted">Search the whole Creator Congress network and invite anyone to your invite-only campaigns. Contact info is shared only after a creator accepts.</p>
+  <form method="get" action="/o/${token}#find" class="card findform">
+    <input name="q" placeholder="Name or handle" value="${esc(crit.q)}">
+    <select name="issue"><option value="">Any issue</option>${issuesAll.map((v) => opt(v, crit.issue)).join('')}</select>
+    <select name="state"><option value="">Any state</option>${statesAll.map((v) => opt(v, crit.state)).join('')}</select>
+    <select name="min"><option value="">Any reach</option>${[1000, 10000, 50000, 100000, 500000].map((n) => `<option value="${n}"${crit.min === n ? ' selected' : ''}>${reachShort(n)}+ followers</option>`).join('')}</select>
+    <button class="primary">Search</button>
+  </form>
+  ${searching ? (results.length ? `<p class="muted">${results.length} creator${results.length === 1 ? '' : 's'} found${results.length > 30 ? ', showing the 30 with the most followers' : ''}.</p>` + results.slice(0, 30).map((c) => {
+      const done = invitedTo(c.id);
+      const left = inviteCamps.filter((p) => !done.includes(p));
+      const action = !left.length
+        ? `<span class="pill">✉️ Invited</span>`
+        : `<form method="post" action="/o/${token}/invitepick/${c.id}" class="actions">${left.length > 1 ? `<select name="camp">${left.map((p) => `<option value="${p.id}">${esc(p.fields[C.f.shortName] || 'Campaign')}</option>`).join('')}</select>` : `<input type="hidden" name="camp" value="${left[0].id}">`}<button class="primary">✉️ Invite${left.length === 1 ? ` to ${esc(left[0].fields[C.f.shortName] || 'campaign')}` : ''}</button></form>`;
+      return `<div class="card">${profileHtml(c.fields)}${done.length ? `<p class="muted">Already invited to ${esc(done.map((p) => p.fields[C.f.shortName]).join(', '))}</p>` : ''}${action}</div>`;
+    }).join('') : '<p class="empty">No creators match. Try fewer filters.</p>') : ''}`;
+  }
+
   const suggestHtml = inviteCamps
     .map((p) => {
       const invitedSet = new Set(p.fields[C.f.invited] || []);
@@ -2648,6 +2765,7 @@ ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>
 <div class="flash">How payment confirmation works: after you pay a creator, click <b>Mark paid</b>. They're asked to confirm it arrived. It shows as <b>✅ Paid</b> once they confirm, or automatically if they don't reply within 14 days. Payments are due within 30 days of the campaign's end date.</div>
 ${reviewHtml}
 ${suggestHtml}
+${findHtml}
 <h2>Your campaigns</h2>
 ${campHtml || '<p class="empty">No campaigns yet.</p>'}
 <footer>This page is private to your organization, so please don't share the link outside your team. Questions? Reply to any Creator Congress email.</footer>`;
@@ -2700,7 +2818,10 @@ const commands = [
   new SlashCommandBuilder().setName('mycampaigns').setDescription('See the campaigns you have signed up for and your expected pay'),
   new SlashCommandBuilder().setName('roster').setDescription('For organizations: see which creators signed up for your campaigns'),
   new SlashCommandBuilder().setName('review').setDescription('For organizations: approve or decline creators who asked to join your campaigns'),
-  new SlashCommandBuilder().setName('invite').setDescription('For organizations: pick suggested creators to invite to your invite-only campaigns'),
+  new SlashCommandBuilder()
+    .setName('invite')
+    .setDescription('For organizations: invite creators to your invite-only campaigns (suggestions, or search by name)')
+    .addStringOption((o) => o.setName('creator').setDescription('Search any approved creator by name or handle').setAutocomplete(true).setRequired(false)),
   new SlashCommandBuilder().setName('payments').setDescription('For organizations: see payment status for your creators and mark them paid'),
   new SlashCommandBuilder().setName('help').setDescription('How Creator Congress campaigns work'),
 ].map((c) => c.toJSON());
@@ -3018,6 +3139,10 @@ async function handleHelp(interaction) {
 }
 
 client.on('interactionCreate', async (interaction) => {
+  if (interaction.isAutocomplete()) {
+    if (interaction.commandName === 'invite') await handleInviteAutocomplete(interaction).catch((err) => log('autocomplete error', err));
+    return;
+  }
   if (interaction.isButton() && interaction.customId.startsWith('py:')) {
     try {
       await handlePayButton(interaction);
