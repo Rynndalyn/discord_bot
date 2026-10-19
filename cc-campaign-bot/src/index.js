@@ -208,6 +208,38 @@ async function syncCampaignPosts() {
     if (hasThread(rec.fields)) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
   }
 
+  // 1a) Repost: delete the old post, post fresh at the bottom, carry sign-ups over to the new post
+  const toRepost = await at.list(C.table, {
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.repost}}, {${C.names.discordMessageId}}!="")`,
+    fields: campaignFields,
+  });
+  for (const rec of toRepost) {
+    const oldId = rec.fields[C.f.discordMessageId];
+    if (isInviteKey(oldId)) {
+      await at.update(C.table, rec.id, { [C.f.repost]: false });
+      continue; // invite-only campaigns have no public post
+    }
+    const old = await channel.messages.fetch(oldId).catch(() => null);
+    if (old) await old.delete().catch((err) => log(`Couldn't delete old post ${oldId}: ${err.message}`));
+    const msg = await channel.send({ embeds: [buildEmbed(rec.fields)] });
+    await msg.react(SIGNUP_EMOJI);
+    await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false, [C.f.repost]: false });
+    // Move every sign-up to the new post. People who'd reacted on the old post are marked so the
+    // reaction check doesn't withdraw them (their old reaction went away with the old post).
+    const rows = await at.list(K.table, { formula: `{${K.names.discordMessageId}}=${at.q(oldId)}`, fields: [K.f.joinedVia, K.f.status] });
+    for (const r of rows) {
+      const via = r.fields[K.f.joinedVia];
+      await at.update(K.table, r.id, {
+        [K.f.discordMessageId]: msg.id,
+        ...(!via || via === 'Discord' ? { [K.f.joinedVia]: 'Discord (reposted)' } : {}),
+      });
+    }
+    campaignByMessage.delete(oldId);
+    campaignByMessage.set(msg.id, campaignInfo(rec));
+    log(`Reposted campaign ${rec.id}: ${oldId} → ${msg.id} (${rows.length} sign-up row(s) moved)`);
+    if (hasThread(rec.fields)) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
+  }
+
   // 1b) Posted campaigns with an org linked but no thread yet (or an old channel to move over) → create its thread
   const needChannel = await at.list(C.table, {
     formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.orgLinks}}!="", {${C.names.discordMessageId}}!="", OR({${C.names.threadId}}="", {${C.names.oldChannelId}}!=""))`,
@@ -692,7 +724,7 @@ async function reconcileOpenCampaigns() {
     }
     for (const r of recorded) {
       const uid = r.fields[K.f.discordUserId];
-      if (['Web page', 'Invitation', 'Portal'].includes(r.fields[K.f.joinedVia])) continue; // joined outside Discord
+      if (['Web page', 'Invitation', 'Portal', 'Discord (reposted)'].includes(r.fields[K.f.joinedVia])) continue; // joined outside Discord, or before a repost
       if (!reactors.has(uid)) {
         await at.update(K.table, r.id, { [K.f.status]: 'Withdrawn', [K.f.withdrawnAt]: now() });
         log(`Reconcile: withdrew ${uid} from ${campaign.name}`);
@@ -806,28 +838,37 @@ async function notifyReviewers(recordId, { reminder = false } = {}) {
       log(`Could not post to review channel: ${err.message}`);
     }
   }
+  // Email the org lead too, so orgs that aren't on Discord can review on their partner page.
+  try {
+    const campFields = await campaignFieldsById(data.camp.id);
+    const cf = data.creator?.fields || {};
+    const who = cf[M.f.fullName] || data.req.fields[K.f.discordUsername] || 'A creator';
+    const campName = campFields?.[C.f.shortName] || 'your campaign';
+    const reach = Number(cf[M.f.reach]);
+    const body =
+      `${reminder ? 'Reminder: ' : ''}${who} has asked to join ${campName}.` +
+      (Number.isFinite(reach) && reach > 0 ? ` They have about ${reach.toLocaleString('en-US')} followers.` : '') +
+      (cf[M.f.state] ? ` Based in ${cf[M.f.state]}.` : '') +
+      `\n\nPlease approve or decline on your partner page (or in Discord with /review). If there's no reply in 7 days, the Creator Congress team will follow up.`;
+    const { email, name } = leadContact(campFields || {});
+    const orgs = (campFields?.[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.pageLink]) : [];
+    const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
+    if (email) {
+      await queueRawEmail({
+        to: email,
+        kind: 'Review request',
+        subject: `${reminder ? 'Reminder: ' : ''}${who} wants to join ${campName}`,
+        body: `Hi ${name ? name.split(' ')[0] : 'there'},\n\n${body}${page ? `\n\n[Review on your partner page](${page}#review)` : ''}\n\nQuestions? Reply to the Creator Congress team.`,
+      });
+    }
+  } catch (err) {
+    log('review email error', err);
+  }
   log(`Review request ${recordId} sent to ${delivered} org contact(s)${reminder ? ' (reminder)' : ''}`);
 }
 
-async function handleReviewButton(interaction) {
-  const [, action, recordId] = interaction.customId.split(':');
-  const data = await loadRequest(recordId);
-  if (!data?.camp) return interaction.reply({ content: 'This request no longer exists.', flags: MessageFlags.Ephemeral });
-  const { req, camp } = data;
-
-  const allowed = (await orgContactIds(camp.fields[C.f.orgLinks])).includes(interaction.user.id) || (await isStaff(interaction.user.id));
-  if (!allowed) return interaction.reply({ content: "You're not a reviewer for this campaign.", flags: MessageFlags.Ephemeral });
-
-  const status = req.fields[K.f.status];
-  if (status !== 'Pending') {
-    const by = req.fields[K.f.reviewedBy] ? ` by ${req.fields[K.f.reviewedBy]}` : '';
-    const word = status === 'Committed' ? 'approved' : status === 'Declined' ? 'declined' : 'withdrawn by the creator';
-    await interaction.update({ components: [] }).catch(() => {});
-    return interaction.followUp({ content: `This request was already ${word}${status === 'Withdrawn' ? '' : by}.`, flags: MessageFlags.Ephemeral });
-  }
-
-  const reviewer = interaction.user.globalName || interaction.user.username;
-  const approve = action === 'a';
+// Approve or decline a Pending request (shared by Discord buttons and the partner page).
+async function applyDecision(req, camp, approve, reviewer) {
   await at.update(K.table, req.id, {
     [K.f.status]: approve ? 'Committed' : 'Declined',
     ...(approve ? { [K.f.committedAt]: now() } : {}),
@@ -866,12 +907,36 @@ async function handleReviewButton(interaction) {
     if (contact) await emailDecision(contact, campFields, false).catch((err) => log('email error', err));
   }
 
+  log(`${approve ? 'Approved' : 'Declined'} ${req.id} by ${reviewer}`);
+}
+
+async function handleReviewButton(interaction) {
+  const [, action, recordId] = interaction.customId.split(':');
+  const data = await loadRequest(recordId);
+  if (!data?.camp) return interaction.reply({ content: 'This request no longer exists.', flags: MessageFlags.Ephemeral });
+  const { req, camp } = data;
+
+  const allowed = (await orgContactIds(camp.fields[C.f.orgLinks])).includes(interaction.user.id) || (await isStaff(interaction.user.id));
+  if (!allowed) return interaction.reply({ content: "You're not a reviewer for this campaign.", flags: MessageFlags.Ephemeral });
+
+  const status = req.fields[K.f.status];
+  if (status !== 'Pending') {
+    const by = req.fields[K.f.reviewedBy] ? ` by ${req.fields[K.f.reviewedBy]}` : '';
+    const word = status === 'Committed' ? 'approved' : status === 'Declined' ? 'declined' : 'withdrawn by the creator';
+    await interaction.update({ components: [] }).catch(() => {});
+    return interaction.followUp({ content: `This request was already ${word}${status === 'Withdrawn' ? '' : by}.`, flags: MessageFlags.Ephemeral });
+  }
+
+  const reviewer = interaction.user.globalName || interaction.user.username;
+  const approve = action === 'a';
+  await interaction.deferUpdate(); // the decision takes a few seconds; Discord needs an answer within 3
+  await applyDecision(req, camp, approve, reviewer);
+
   const done = EmbedBuilder.from(interaction.message.embeds[0])
     .setAuthor({ name: approve ? `✅  APPROVED by ${reviewer}` : `✖️  DECLINED by ${reviewer}` })
     .setColor(approve ? 0x2ecc71 : 0x4f545c)
     .setFooter({ text: approve ? 'The creator has been notified and added.' : 'The creator was sent a kind, private note. No reason was shared.' });
-  log(`${approve ? 'Approved' : 'Declined'} ${req.id} by ${reviewer}`);
-  return interaction.update({ embeds: [done], components: [] });
+  return interaction.editReply({ embeds: [done], components: [] });
 }
 
 async function handleReview(interaction) {
@@ -1014,6 +1079,11 @@ async function computeSuggestions(rec) {
     [C.f.refreshSuggestions]: false,
   });
   log(`Suggested ${ranked.length} creators for ${rec.id}`);
+  if (ranked.length && !f[C.f.refreshSuggestions]) {
+    const campName = f[C.f.shortName] || 'your campaign';
+    const msg = `✨ We found **${ranked.length} suggested creators** for **${campName}**. Pick who to invite with \`/invite\` in Discord or on your partner page.`;
+    notifyOrg(f, { dmText: msg, subject: `Suggested creators for ${campName}`, body: msg.replace(/\*\*/g, '').replace(/`/g, ''), always: true }).catch((err) => log('notify error', err));
+  }
 }
 
 function inviteRow(rowId) {
@@ -1616,26 +1686,36 @@ async function respondToInvite(rowId, accept) {
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 
+// Branding (override in Railway: LOGO_URL, BRAND_PINK, BRAND_ORANGE)
+const LOGO_URL = process.env.LOGO_URL ?? 'https://images.squarespace-cdn.com/content/v1/667725a3fbb63c107d15b61d/ccf49d96-596f-49f7-942f-aa6aaf9d681e/cclogo.png?format=500w';
+const BRAND_PINK = process.env.BRAND_PINK || '#e6287e';
+const BRAND_ORANGE = process.env.BRAND_ORANGE || '#ff7a1f';
+const brandHtml = (label) =>
+  `<div class="brand">${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Creator Congress" onerror="this.remove()">` : ''}<span>Creator Congress${label ? ` · ${esc(label)}` : ''}</span></div>`;
+
 const PAGE_CSS = `
-:root{--bg:#f6f7f4;--card:#fff;--ink:#1d2320;--muted:#5d6762;--line:#e3e6e1;--accent:#1f7a4d;--accent-ink:#fff;--soft:#e8f3ec;--warn:#8a5a00;--warn-soft:#fbf1dc;--violet:#5b3fa6;--violet-soft:#efeafb}
-@media (prefers-color-scheme:dark){:root{--bg:#121513;--card:#1b1f1c;--ink:#ecefeb;--muted:#a3ada7;--line:#2c322e;--accent:#4cc38a;--accent-ink:#0d1a12;--soft:#1f3329;--warn:#f0c46b;--warn-soft:#3a2f17;--violet:#b9a4f2;--violet-soft:#2a2340}}
+:root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
+@media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
+body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 .wrap{max-width:720px;margin:0 auto;padding:24px 16px 64px}
 header h1{font-size:26px;margin:4px 0 2px}header p{margin:0;color:var(--muted)}
-.brand{font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.brand{display:flex;align-items:center;gap:10px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);font-weight:700;margin-bottom:6px}.brand img{height:40px;width:auto;display:block}
+header h1{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.stat b{color:var(--accent)}.card{border-top:3px solid var(--accent)}.tag{border-color:var(--soft);background:var(--soft);color:var(--violet)}
 .stats{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0 8px}.stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-size:14px}.stat b{font-size:18px;display:block}
-h2{font-size:15px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:32px 0 10px}
+h2{font-size:15px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent2);margin:32px 0 10px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:0 0 12px}
 .card h3{margin:0 0 2px;font-size:18px}.org{color:var(--muted);font-size:14px;margin:0 0 10px}
 .meta{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:14px;margin:8px 0}.meta span{white-space:nowrap}
-.bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin:4px 0 8px;max-width:220px}.bar i{display:block;height:100%;background:var(--accent)}
+.bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin:4px 0 8px;max-width:220px}.bar i{display:block;height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2))}
 .tags{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}.tag{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:2px 8px;color:var(--muted)}
 details{margin:6px 0 10px;font-size:14px;color:var(--muted)}details summary{cursor:pointer;color:var(--ink)}details p{white-space:pre-wrap}
 .note{font-size:13px;border-radius:8px;padding:6px 10px;margin:8px 0;background:var(--warn-soft);color:var(--warn)}
 .note.violet{background:var(--violet-soft);color:var(--violet)}
 .actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px}form{margin:0}
 button{font:inherit;font-weight:600;border-radius:8px;padding:9px 16px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer}
-button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}button:disabled{opacity:.55;cursor:default}
+button.primary{background:linear-gradient(90deg,var(--accent),var(--accent2));border-color:transparent;color:var(--accent-ink)}button:disabled{opacity:.55;cursor:default}
 .pill{font-size:13px;font-weight:600;border-radius:999px;padding:4px 10px;background:var(--soft);color:var(--accent)}
 .pill.wait{background:var(--warn-soft);color:var(--warn)}.pill.gray{background:var(--line);color:var(--muted)}
 .flash{border-radius:10px;padding:12px 14px;margin:16px 0;background:var(--soft);color:var(--ink);border:1px solid var(--line)}
@@ -1646,17 +1726,17 @@ footer{margin-top:40px;font-size:13px;color:var(--muted)}
 .contact-h:not(:first-child){margin-top:14px}.contact p{margin:4px 0}.contact .who{font-size:16px}
 .muted{color:var(--muted);font-size:14px}.md{font-size:15px}.md ul,.md ol{margin:4px 0;padding-left:20px}.md a,.contact a{color:var(--accent)}
 a.btn{display:inline-block;font-weight:600;border-radius:8px;padding:8px 14px;text-decoration:none;border:1px solid var(--line)}
-a.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+a.btn.primary{background:linear-gradient(90deg,var(--accent),var(--accent2));border-color:transparent;color:var(--accent-ink)}
 .past{padding:6px 0;border-bottom:1px solid var(--line)}.past:last-child{border-bottom:0}
 .pay{margin:12px 0 4px;padding:10px 14px;border-radius:10px;border:1px solid var(--line)}.pay p{margin:4px 0}
-.pay.orgsayspaid,.pay.paymentdue{background:var(--warn-soft);border-color:transparent}.pay.paid{background:var(--soft);border-color:transparent}
+.pay.orgsayspaid,.pay.paymentdue{background:var(--warn-soft);border-color:transparent}.pay.paid{background:var(--ok-soft);border-color:transparent}
 .pay.issue{background:#fde8e8;border-color:transparent;color:#8a1f1f}
 @media (prefers-color-scheme:dark){.pay.issue{background:#3a1c1c;color:#f3b0b0}}
 .notpaid summary{font-size:14px;padding:8px 0}.notpaid form{display:flex;flex-direction:column;gap:8px;margin-top:6px}
 textarea,input{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--ink);max-width:100%}
 .row{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
 .row-main{flex:1 1 260px;min-width:0}.row-main a{color:var(--accent);word-break:break-all}
-.paystat{font-size:14px;margin-top:2px}.paystat.paid{color:var(--accent)}.paystat.issue{color:#b42318}.paystat.paymentdue{color:var(--warn)}
+.paystat{font-size:14px;margin-top:2px}.paystat.paid{color:var(--ok)}.paystat.issue{color:#b42318}.paystat.paymentdue{color:var(--warn)}
 .markpaid{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.markpaid label{font-size:14px;color:var(--muted)}.markpaid input[name=note]{flex:1 1 180px}
 `;
 
@@ -1749,7 +1829,7 @@ async function renderCreatorPage(creator, token, flash) {
   const firstName = cf[M.f.firstName] || String(cf[M.f.fullName] || '').split(' ')[0] || 'there';
   const section = (title, html) => `<h2>${title}</h2>${html}`;
   const body = `
-<header><div class="brand">Creator Congress</div><h1>Hi ${esc(firstName)} 👋</h1><p>Your campaigns, invitations and expected pay, all in one place.</p></header>
+<header>${brandHtml()}<h1>Hi ${esc(firstName)} 👋</h1><p>Your campaigns, invitations and expected pay, all in one place.</p></header>
 ${flash && FLASH[flash] ? `<div class="flash">${esc(FLASH[flash])}</div>` : ''}
 <div class="stats">
   <div class="stat"><b>${esc(money(expected) || '$0')}</b>expected pay</div>
@@ -1782,18 +1862,43 @@ function startWebServer() {
     res.end(html);
   };
   const simple = (title, msg) =>
-    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${PAGE_CSS}</style></head><body><div class="wrap"><div class="brand">Creator Congress</div><h1>${esc(title)}</h1><p>${esc(msg)}</p></div></body></html>`;
+    `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${brandHtml()}<h1>${esc(title)}</h1><p>${esc(msg)}</p></div></body></html>`;
 
   createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
       // Partner (org) page
-      const om = url.pathname.match(/^\/o\/([a-f0-9]{32})(?:\/paid\/(rec[A-Za-z0-9]{14}))?\/?$/);
+      const om = url.pathname.match(/^\/o\/([a-f0-9]{32})(?:\/paid\/(rec[A-Za-z0-9]{14})|\/review\/(rec[A-Za-z0-9]{14})\/(approve|decline)|\/(invite|skip)\/(rec[A-Za-z0-9]{14})\/(rec[A-Za-z0-9]{14}))?\/?$/);
       if (om) {
-        const [, otoken, payRowId] = om;
+        const [, otoken, payRowId, reviewRowId, decision, inviteVerb, invCampId, invCreatorId] = om;
         const org = await orgByToken(otoken);
         if (!org || !org.fields[O.f.approved]) return send(res, 404, simple('Link not recognized', 'This link may have expired. Contact the Creator Congress team for a new one.'));
+        if (req.method === 'POST' && (reviewRowId || inviteVerb)) {
+          const ids = org.fields[O.f.proposals] || [];
+          const props = ids.length ? await listByIds(C.table, ids, [C.f.commitments]) : [];
+          let result = 'missing';
+          const orgName = `${org.fields[O.f.organization] || 'Org'} (partner page)`;
+          if (reviewRowId && props.some((p) => (p.fields[C.f.commitments] || []).includes(reviewRowId))) {
+            const data = await loadRequest(reviewRowId);
+            if (data?.camp && data.req.fields[K.f.status] === 'Pending') {
+              await applyDecision(data.req, data.camp, decision === 'approve', orgName);
+              result = decision === 'approve' ? 'approved' : 'declined';
+            } else result = 'decided';
+          } else if (inviteVerb && ids.includes(invCampId)) {
+            const p = await at.first(C.table, { formula: `RECORD_ID()=${at.q(invCampId)}`, fields: [C.f.suggested, C.f.invited] });
+            if (p) {
+              const suggested = (p.fields[C.f.suggested] || []).filter((x) => x !== invCreatorId);
+              const invited = new Set(p.fields[C.f.invited] || []);
+              if (inviteVerb === 'invite') invited.add(invCreatorId);
+              await at.update(C.table, p.id, { [C.f.suggested]: suggested, [C.f.invited]: [...invited] });
+              log(`${inviteVerb === 'invite' ? 'Invited' : 'Skipped'} ${invCreatorId} for ${p.id} via partner page`);
+              result = inviteVerb === 'invite' ? 'invited' : 'skipped';
+            }
+          }
+          res.writeHead(303, { Location: `/o/${otoken}?done=${encodeURIComponent(result)}`, 'Cache-Control': 'no-store' });
+          return res.end();
+        }
         if (req.method === 'POST' && payRowId) {
           const form = await readForm(req);
           const props = (org.fields[O.f.proposals] || []).length ? await listByIds(C.table, org.fields[O.f.proposals], [C.f.commitments]) : [];
@@ -2414,6 +2519,11 @@ async function orgByToken(token) {
 }
 
 const ORG_FLASH = {
+  approved: '✅ Approved. The creator has been told and added to the campaign.',
+  declined: 'Declined. The creator was sent a kind note; no reason was shared.',
+  decided: 'Someone already made a decision on that request.',
+  invited: '✉️ Invited. Their invitation goes out within 2 minutes (once the campaign is live).',
+  skipped: 'Removed from your suggestions.',
   marked: '📤 Marked paid. The creator has been asked to confirm they received it.',
   alreadypaid: 'That creator already confirmed they were paid.',
   missing: "We couldn't find that creator on your campaigns.",
@@ -2428,6 +2538,70 @@ async function renderOrgPage(org, token, flash) {
   const paidRows = rows.filter((r) => isPaidCampaignRow(r));
   const tot = (s) => paidRows.filter((r) => payStatusOf(r) === s).reduce((t, r) => t + rowAmount(r), 0);
   const cnt = (s) => paidRows.filter((r) => payStatusOf(r) === s).length;
+
+  // Requests waiting for review + suggestions for invite-only campaigns
+  const allRows = rowIds.length ? await listByIds(K.table, rowIds, [K.f.status, K.f.campaign, K.f.creator, K.f.requestedAt, K.f.discordUsername]) : [];
+  const pending = allRows.filter((r) => r.fields[K.f.status] === 'Pending');
+  const inviteCamps = props.filter((p) => p.fields[C.f.status] === C.ACTIVE && modeOf(p.fields) === 'invite');
+  const profileIds = new Set(pending.map((r) => first1(r.fields[K.f.creator])).filter(Boolean));
+  for (const p of inviteCamps) for (const id of p.fields[C.f.suggested] || []) profileIds.add(id);
+  const profiles = new Map(
+    (profileIds.size
+      ? await listByIds(M.table, [...profileIds], [M.f.fullName, M.f.reach, M.f.tiktok, M.f.instagram, M.f.youtube, M.f.issues, M.f.about, M.f.state])
+      : []
+    ).map((m) => [m.id, m.fields])
+  );
+  const campName = (id) => props.find((p) => p.id === id)?.fields[C.f.shortName] || 'Campaign';
+  const profileHtml = (cf, fallback) => {
+    const reach = Number(cf?.[M.f.reach]);
+    const handles = [cf?.[M.f.tiktok] && `TikTok ${cf[M.f.tiktok]}`, cf?.[M.f.instagram] && `Instagram ${cf[M.f.instagram]}`, cf?.[M.f.youtube] && `YouTube ${cf[M.f.youtube]}`].filter(Boolean);
+    const issues = Array.isArray(cf?.[M.f.issues]) ? cf[M.f.issues].slice(0, 6) : [];
+    const about = String(cf?.[M.f.about] || '').trim();
+    return `<b>${esc(cf?.[M.f.fullName] || fallback || 'Creator')}</b>
+      <div class="meta">${cf?.[M.f.state] ? `<span>📍 ${esc(cf[M.f.state])}</span>` : ''}${Number.isFinite(reach) && reach > 0 ? `<span>👥 ${esc(reach.toLocaleString('en-US'))} followers</span>` : ''}${handles.length ? `<span>${esc(handles.join(' · '))}</span>` : ''}</div>
+      ${issues.length ? `<div class="tags">${issues.map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
+      ${about ? `<details><summary>About</summary><p>${esc(about.slice(0, 800))}</p></details>` : ''}`;
+  };
+  const reviewHtml = pending.length
+    ? `<h2 id="review">🙋 Waiting for your review (${pending.length})</h2>` +
+      pending
+        .map((r) => {
+          const req = r.fields[K.f.requestedAt];
+          return `<div class="card"><p class="org">Wants to join <b>${esc(campName(first1(r.fields[K.f.campaign])))}</b>${req ? ` · requested ${esc(fmtDate(req.slice(0, 10)))}` : ''}</p>
+  ${profileHtml(profiles.get(first1(r.fields[K.f.creator])), r.fields[K.f.discordUsername])}
+  <div class="actions"><form method="post" action="/o/${token}/review/${r.id}/approve"><button class="primary">✅ Approve</button></form><form method="post" action="/o/${token}/review/${r.id}/decline"><button>Decline</button></form></div></div>`;
+        })
+        .join('') +
+      `<p class="muted">Declined creators get a kind note. No reason is shared. Requests waiting 7+ days are flagged to the Creator Congress team.</p>`
+    : '';
+  const suggestHtml = inviteCamps
+    .map((p) => {
+      const invitedSet = new Set(p.fields[C.f.invited] || []);
+      const sugg = (p.fields[C.f.suggested] || []).filter((id) => !invitedSet.has(id));
+      const reasons = new Map(
+        String(p.fields[C.f.suggestionNotes] || '')
+          .split('\n')
+          .map((l) => l.match(/^\d+\.\s+(.+?):\s+(.*)$/))
+          .filter(Boolean)
+          .map((m) => [m[1].trim(), m[2]])
+      );
+      const status = (id) => allRows.find((r) => first1(r.fields[K.f.campaign]) === p.id && first1(r.fields[K.f.creator]) === id)?.fields[K.f.status];
+      const invitedList = [...invitedSet].map((id) => {
+        const st = status(id);
+        const label = st === 'Committed' ? '✅ accepted' : st === 'Declined invite' ? '👋 passed' : '✉️ invited';
+        return `<span class="tag">${esc(profiles.get(id)?.[M.f.fullName] || 'Creator')} · ${label}</span>`;
+      });
+      return `<h2>✨ Suggested creators: ${esc(p.fields[C.f.shortName] || 'Campaign')}</h2>
+  <p class="muted">Invite-only. Best matches first, based on shared issues, location and reach. Nobody is invited until you click Invite.</p>
+  ${invitedList.length ? `<p class="muted">Already invited:</p><div class="tags">${invitedList.join('')}</div>` : ''}
+  ${sugg.length ? sugg.map((id) => {
+        const cf = profiles.get(id);
+        const why = reasons.get(String(cf?.[M.f.fullName] || '').trim());
+        return `<div class="card">${profileHtml(cf)}${why ? `<p class="muted">Why: ${esc(why)}</p>` : ''}
+  <div class="actions"><form method="post" action="/o/${token}/invite/${p.id}/${id}"><button class="primary">✉️ Invite</button></form><form method="post" action="/o/${token}/skip/${p.id}/${id}"><button>Not a fit</button></form></div></div>`;
+      }).join('') : '<p class="empty">No more suggestions right now. Ask the Creator Congress team to refresh them.</p>'}`;
+    })
+    .join('');
 
   const campHtml = props
     .map((p) => {
@@ -2463,8 +2637,8 @@ async function renderOrgPage(org, token, flash) {
     .join('');
 
   const body = `
-<header><div class="brand">Creator Congress · Partner page</div><h1>${esc(org.fields[O.f.organization] || 'Your organization')}</h1>
-<p>Your confirmed creators, how to reach them, and where each payment stands.</p></header>
+<header>${brandHtml('Partner page')}<h1>${esc(org.fields[O.f.organization] || 'Your organization')}</h1>
+<p>Review requests, invite creators, see who's confirmed, and track payments.</p></header>
 ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>` : ''}
 <div class="stats">
   <div class="stat"><b>${cnt('Paid')}</b>paid${tot('Paid') ? ` · ${esc(money(tot('Paid')))}` : ''}</div>
@@ -2472,6 +2646,9 @@ ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>
   <div class="stat"><b>${cnt('Payment due') + cnt('Issue')}</b>to pay${tot('Payment due') + tot('Issue') ? ` · ${esc(money(tot('Payment due') + tot('Issue')))}` : ''}</div>
 </div>
 <div class="flash">How payment confirmation works: after you pay a creator, click <b>Mark paid</b>. They're asked to confirm it arrived. It shows as <b>✅ Paid</b> once they confirm, or automatically if they don't reply within 14 days. Payments are due within 30 days of the campaign's end date.</div>
+${reviewHtml}
+${suggestHtml}
+<h2>Your campaigns</h2>
 ${campHtml || '<p class="empty">No campaigns yet.</p>'}
 <footer>This page is private to your organization, so please don't share the link outside your team. Questions? Reply to any Creator Congress email.</footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Partner page · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
