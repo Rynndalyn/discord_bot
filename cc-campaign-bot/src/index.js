@@ -476,28 +476,44 @@ async function doSyncCampaignThread(rec) {
   }
 
   const want = new Set([...(await committedDiscordIds(f)), ...orgIds]);
-  const current = await thread.members.fetch().catch(() => new Map());
-  for (const id of current.keys()) welcomedToThread.add(`${thread.id}:${id}`);
+  // Ask Discord about each person individually. (Listing every thread member needs the privileged
+  // "Server Members" intent; without it the list comes back empty and everyone looks new.)
+  const inThread = async (id) => {
+    try {
+      await thread.members.fetch({ member: id, force: true });
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const newcomers = [];
   for (const id of want) {
-    if (current.has(id)) continue;
+    const key = `${thread.id}:${id}`;
+    if (await inThread(id)) {
+      welcomedToThread.add(key);
+      continue;
+    }
     try {
       await thread.members.add(id);
-      // Discord's member list can lag a few seconds, so a back-to-back sync may "add" someone twice.
-      // Only welcome each person once per thread.
-      const key = `${thread.id}:${id}`;
       if (!welcomedToThread.has(key)) {
-        welcomedToThread.add(key);
+        welcomedToThread.add(key); // never ping the same person twice in one thread
         newcomers.push(id);
       }
     } catch (err) {
       log(`Couldn't add ${id} to thread ${thread.id}: ${err.message}`);
     }
   }
-  for (const id of current.keys()) {
-    if (id === client.user.id || want.has(id)) continue;
-    if (await isStaff(id)) continue; // staff who joined on their own stay
+  // Remove people who left or were declined (staff who joined on their own stay).
+  const gone = await at.list(K.table, {
+    formula: `AND({${K.names.discordMessageId}}=${at.q(f[C.f.discordMessageId])}, OR({${K.names.status}}="Withdrawn", {${K.names.status}}="Declined", {${K.names.status}}="Declined invite"))`,
+    fields: [K.f.discordUserId],
+  });
+  for (const id of new Set(gone.map((r) => r.fields[K.f.discordUserId]).filter(isSnowflake))) {
+    if (want.has(id) || id === client.user.id) continue;
+    if (!(await inThread(id))) continue;
+    if (await isStaff(id)) continue;
     await thread.members.remove(id).catch(() => {});
+    welcomedToThread.delete(`${thread.id}:${id}`);
   }
 
   if (isNew) {
@@ -638,7 +654,29 @@ async function resolveReaction(reaction, user) {
   if (reaction.message.channelId !== CAMPAIGN_CHANNEL_ID) return null;
   if (reaction.emoji.name !== SIGNUP_EMOJI) return null;
   const campaign = await getCampaignForMessage(reaction.message.id);
-  return campaign ? { campaign, messageId: reaction.message.id } : null;
+  if (campaign) return { campaign, messageId: reaction.message.id };
+  // A bot post whose campaign was deleted or replaced in Airtable: tell people instead of ignoring them.
+  if (reaction.message.partial) await reaction.message.fetch().catch(() => {});
+  if (reaction.message.author?.id === client.user.id) return { orphan: true, messageId: reaction.message.id };
+  return null;
+}
+
+const closedOrphans = new Set();
+async function handleOrphanReaction(reaction, user) {
+  await reaction.users.remove(user.id).catch(() => {});
+  await dm(user, `That campaign post is out of date, so your sign-up wasn't recorded. Check <#${CAMPAIGN_CHANNEL_ID}> for the current version of the campaign and react there. 💚`);
+  const msg = reaction.message;
+  if (closedOrphans.has(msg.id)) return;
+  closedOrphans.add(msg.id);
+  try {
+    const old = msg.embeds[0];
+    const e = old ? EmbedBuilder.from(old) : new EmbedBuilder().setTitle('Campaign');
+    e.setAuthor({ name: '⛔  NO LONGER ACTIVE' }).setColor(0x4f545c).setFooter({ text: 'This post is out of date. Look for the current campaign in this channel.' });
+    await msg.edit({ embeds: [e] });
+    log(`Marked out-of-date post ${msg.id} (no campaign in Airtable)`);
+  } catch (err) {
+    log(`Couldn't mark out-of-date post ${msg.id}: ${err.message}`);
+  }
 }
 
 // Only nudge unlinked members to /link once: on their very first sign-up (survives restarts).
@@ -654,6 +692,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
   try {
     const hit = await resolveReaction(reaction, user);
     if (!hit) return;
+    if (hit.orphan) return handleOrphanReaction(reaction, user);
     if (hit.campaign.closed) {
       await reaction.users.remove(user.id).catch(() => {});
       await dm(user, `**${hit.campaign.name}** is closed, so your sign-up wasn't recorded.`);
@@ -683,7 +722,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
 client.on('messageReactionRemove', async (reaction, user) => {
   try {
     const hit = await resolveReaction(reaction, user);
-    if (!hit || hit.campaign.closed) return; // removals on closed posts (incl. our own cleanup) don't withdraw
+    if (!hit || hit.orphan || hit.campaign.closed) return; // removals on closed or out-of-date posts (incl. our own cleanup) don't withdraw
     await withdraw(user, hit.messageId, hit.campaign);
   } catch (err) {
     log('reactionRemove error', err);
