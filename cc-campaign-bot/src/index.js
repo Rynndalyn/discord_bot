@@ -27,7 +27,7 @@ import {
 import { createServer } from 'node:http';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
-import { guideHtml } from './guide.js';
+import { guideHtml, DISCORD_GUIDE } from './guide.js';
 import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS } from './schema.js';
 
 const {
@@ -4127,8 +4127,70 @@ async function poll() {
   }
 }
 
+// ---------- the how-to guide inside Discord (GUIDE_CHANNEL_ID) ----------
+// One post per topic from guide.js. Missing posts are created, changed ones edited in place, so updating the guide
+// is just editing guide.js and redeploying. In a Forum each topic is its own post (the first is pinned); in a text
+// channel each topic is one message. Posts are locked so the channel stays tidy (staff can still reply).
+function guideEmbed(item) {
+  const guideUrl = GUIDE_URL || (publicBase() ? `${publicBase()}/guide` : '');
+  const body = item.body
+    .replaceAll('{campaigns}', `<#${CAMPAIGN_CHANNEL_ID}>`)
+    .replaceAll('{guide}', guideUrl || 'the campaigns page');
+  return new EmbedBuilder().setAuthor({ name: 'CREATOR CONGRESS · HOW IT WORKS' }).setTitle(item.title.slice(0, 256)).setColor(0xe6287e).setDescription(body.slice(0, 4096));
+}
+const sameEmbed = (msg, embed) => {
+  const e = msg?.embeds?.[0];
+  return !!e && e.title === embed.data.title && e.description === embed.data.description;
+};
+
+async function syncDiscordGuide() {
+  const id = process.env.GUIDE_CHANNEL_ID;
+  if (!isSnowflake(id)) return;
+  const ch = await client.channels.fetch(id);
+  let made = 0, edited = 0;
+  if (ch.type === ChannelType.GuildForum) {
+    const active = await ch.threads.fetchActive().catch(() => null);
+    const archived = await ch.threads.fetchArchived({ limit: 100 }).catch(() => null);
+    const mine = [...(active?.threads.values() || []), ...(archived?.threads.values() || [])].filter((t) => t.parentId === ch.id && t.ownerId === client.user.id);
+    // Create in reverse so the first topic ends up at the top of a "newest first" forum.
+    for (const item of [...DISCORD_GUIDE].reverse()) {
+      const embed = guideEmbed(item);
+      let thread = mine.find((t) => t.name === item.title.slice(0, 100));
+      if (!thread) {
+        thread = await ch.threads.create({ name: item.title.slice(0, 100), autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek, message: { embeds: [embed] } });
+        made++;
+      } else {
+        const starter = await thread.fetchStarterMessage().catch(() => null);
+        if (!sameEmbed(starter, embed)) {
+          if (thread.archived) await thread.setArchived(false).catch(() => {});
+          if (starter) await starter.edit({ embeds: [embed] });
+          edited++;
+        }
+      }
+      if (!thread.locked) await thread.setLocked(true).catch(() => {});
+      if (item.pin && !thread.flags?.has?.('Pinned')) await thread.pin().catch(() => {});
+    }
+  } else if (ch.isTextBased()) {
+    const recent = await ch.messages.fetch({ limit: 100 });
+    const mine = [...recent.values()].filter((m) => m.author.id === client.user.id && m.embeds[0]?.title);
+    for (const item of DISCORD_GUIDE) {
+      const embed = guideEmbed(item);
+      const msg = mine.find((m) => m.embeds[0].title === embed.data.title);
+      if (!msg) {
+        await ch.send({ embeds: [embed] });
+        made++;
+      } else if (!sameEmbed(msg, embed)) {
+        await msg.edit({ embeds: [embed] });
+        edited++;
+      }
+    }
+  }
+  log(`Discord guide in #${ch.name}: ${made} new, ${edited} updated, ${DISCORD_GUIDE.length - made - edited} unchanged`);
+}
+
 client.once('clientReady', async () => {
   log(`Logged in as ${client.user.tag}`);
+  syncDiscordGuide().catch((err) => log(`Couldn't update the Discord guide: ${err.message}`));
   const guild = client.guilds.cache.get(DISCORD_GUILD_ID);
   log(guild ? `Found server: ${guild.name}` : `WARNING: bot is not in server ${DISCORD_GUILD_ID}. Check DISCORD_GUILD_ID or re-invite the bot.`);
   try {
