@@ -45,7 +45,9 @@ const {
   ORG_CATEGORY = 'Partner Organizations',
 } = process.env;
 
-for (const [k, v] of Object.entries({ DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, CAMPAIGN_CHANNEL_ID, AIRTABLE_TOKEN: process.env.AIRTABLE_TOKEN })) {
+// Backup host: STANDBY=true keeps this copy quiet (no Discord, no Airtable changes) so only one copy of the bot runs.
+const STANDBY = /^(1|true|yes|on)$/i.test(String(process.env.STANDBY || '').trim());
+for (const [k, v] of Object.entries(STANDBY ? {} : { DISCORD_TOKEN, DISCORD_CLIENT_ID, DISCORD_GUILD_ID, CAMPAIGN_CHANNEL_ID, AIRTABLE_TOKEN: process.env.AIRTABLE_TOKEN })) {
   if (!v) {
     console.error(`Missing required env var ${k}. See .env.example.`);
     process.exit(1);
@@ -359,6 +361,61 @@ async function syncCampaignPosts() {
   });
   for (const rec of toReopen) {
     await editPost(channel, rec, false);
+  }
+
+  // 4) Refresh: an open post whose Airtable details changed (pay, dates, description, tags...) gets edited in place.
+  const live = await at.list(C.table, {
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.discordMessageId}}!="", NOT({${C.names.discordClosed}}), NOT({${C.names.repost}}))`,
+    fields: campaignFields,
+  });
+  for (const rec of live) await refreshPost(rec);
+}
+
+// What a post currently shows, so we only edit when something changed. Kept in memory: after a restart every open
+// post is refreshed once, which also picks up edits made while the bot was down.
+const postShown = new Map(); // messageId -> fingerprint
+async function refreshPost(rec) {
+  const messageId = rec.fields[C.f.discordMessageId];
+  if (!messageId || isInviteKey(messageId)) return;
+  try {
+    const embed = buildEmbed(rec.fields);
+    const ch = await campaignChannel();
+    const tags = campaignIsForum ? await forumTagsFor(ch, rec.fields) : [];
+    const print = JSON.stringify([embed.toJSON ? embed.toJSON() : embed, postTitle(rec.fields), [...tags].sort()]);
+    if (postShown.get(messageId) === print) return;
+    // Only treat the post as gone when Discord says so (Unknown Channel / Unknown Message), never on a network blip.
+    let msg = null, gone = false;
+    try {
+      if (campaignIsForum) {
+        const thread = await client.channels.fetch(messageId);
+        if (thread?.parentId !== ch.id) gone = true;
+        else msg = await thread.fetchStarterMessage();
+      } else {
+        msg = await ch.messages.fetch(messageId);
+      }
+    } catch (err) {
+      if (err.code === 10003 || err.code === 10008) gone = true;
+      else throw err;
+    }
+    if (gone) {
+      // The post is gone (deleted, or it lives in the old campaign channel): post it fresh and carry sign-ups over.
+      log(`Campaign ${rec.id}: post ${messageId} not found in the campaign channel, reposting`);
+      await at.update(C.table, rec.id, { [C.f.repost]: true });
+      postShown.delete(messageId);
+      return;
+    }
+    if (!msg) return;
+    await msg.edit({ embeds: [embed] });
+    if (campaignIsForum) {
+      const thread = await client.channels.fetch(messageId).catch(() => null);
+      if (thread && (thread.name !== postTitle(rec.fields) || String([...thread.appliedTags].sort()) !== String([...tags].sort()))) {
+        await thread.edit({ name: postTitle(rec.fields), appliedTags: tags });
+      }
+    }
+    if (postShown.has(messageId)) log(`Updated post for campaign ${rec.id}`);
+    postShown.set(messageId, print);
+  } catch (err) {
+    log(`Could not refresh post for ${rec.id}: ${err.message}`);
   }
 }
 
@@ -1761,6 +1818,12 @@ async function ensurePortalTokens() {
   });
   for (const r of broken) await at.update(M.table, r.id, { [M.f.pageLink]: `${publicBase()}/c/${r.fields[M.f.portalToken]}` });
   if (broken.length) log(`Repaired ${broken.length} campaigns-page link(s) missing https://`);
+  // Moved to a new web address (PUBLIC_URL changed)? Point every saved link at it. Tokens stay the same.
+  const base = publicBase();
+  const moved = (await at.list(M.table, { formula: `{${M.names.portalToken}}!=""`, fields: [M.f.portalToken, M.f.pageLink] }))
+    .filter((r) => r.fields[M.f.pageLink] && !String(r.fields[M.f.pageLink]).startsWith(base + '/c/'));
+  for (const r of moved) await at.update(M.table, r.id, { [M.f.pageLink]: `${base}/c/${r.fields[M.f.portalToken]}` });
+  if (moved.length) log(`Moved ${moved.length} campaigns-page link(s) to ${base}`);
   const rows = await at.list(M.table, {
     formula: `AND({${M.names.approved}}, {${M.names.portalToken}}="")`,
     fields: CREATOR_CONTACT_FIELDS(),
@@ -2802,6 +2865,11 @@ async function ensureOrgTokens() {
     await at.update(O.table, r.id, { [O.f.pageToken]: token, [O.f.pageLink]: `${publicBase()}/o/${token}` });
   }
   if (rows.length) log(`Issued partner-page links to ${rows.length} org(s)`);
+  const base = publicBase();
+  const moved = (await at.list(O.table, { formula: `{${O.names.pageToken}}!=""`, fields: [O.f.pageToken, O.f.pageLink] }))
+    .filter((r) => r.fields[O.f.pageLink] && !String(r.fields[O.f.pageLink]).startsWith(base + '/o/'));
+  for (const r of moved) await at.update(O.table, r.id, { [O.f.pageLink]: `${base}/o/${r.fields[O.f.pageToken]}` });
+  if (moved.length) log(`Moved ${moved.length} partner-page link(s) to ${base}`);
 }
 
 async function orgByToken(token) {
@@ -3915,6 +3983,19 @@ client.on('warn', (m) => log('Discord warning', m));
 client.on('shardDisconnect', (e) => log(`Discord disconnected (code ${e?.code})`));
 if (process.env.DEBUG) client.on('debug', (m) => log('[debug]', m));
 
+if (STANDBY) {
+  // Answer health checks and show a short "switching servers" page; do nothing else.
+  createServer((req, res) => {
+    if (req.url.startsWith('/health')) {
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      return res.end('standby');
+    }
+    res.writeHead(503, { 'Content-Type': 'text/html; charset=utf-8', 'Retry-After': '300' });
+    res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Creator Congress</title>' +
+      '<body style="font-family:system-ui,sans-serif;max-width:520px;margin:15vh auto;padding:0 16px;text-align:center">' +
+      '<h1 style="color:#e6287e">One moment</h1><p>Creator Congress is switching servers. Please try this link again in a few minutes.</p></body>');
+  }).listen(Number(process.env.PORT) || 8080, () => log(`STANDBY mode: not connecting to Discord or changing Airtable. Set STANDBY=false to make this copy live.`));
+} else {
 log('Bot starting…');
 startWebServer();
 log(
@@ -3933,3 +4014,4 @@ client
     log('DISCORD LOGIN FAILED:', err.code || '', err.message);
     process.exit(1);
   });
+}
