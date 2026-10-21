@@ -28,7 +28,7 @@ import { createServer } from 'node:http';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
 import { guideHtml, DISCORD_GUIDE } from './guide.js';
-import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS } from './schema.js';
+import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS, INBOUND } from './schema.js';
 
 const {
   DISCORD_TOKEN,
@@ -739,6 +739,94 @@ async function sweepCampaignThreads() {
     });
     for (const rec of live) await setForumPostOpen(rec.fields[C.f.discordMessageId], true);
   }
+}
+
+// ---------- posts by email (hello@creatorcongress.net → Gmail filter → Airtable "Inbound Email" table) ----------
+// Each new row: match the sender to an approved creator, find the campaign, log every post link like /submit,
+// and email back what happened. Non-creators are marked and left alone (no reply), so ordinary mail is never answered.
+const URL_RE = /\b(?:https?:\/\/)?(?:www\.|m\.|vm\.)?(?:tiktok\.com|instagram\.com|instagr\.am|youtube\.com|youtu\.be|twitter\.com|x\.com|threads\.net|threads\.com|bsky\.app|facebook\.com|fb\.watch|twitch\.tv|[a-z0-9-]+\.substack\.com)\/[^\s<>()"'\]]+/gi;
+function postLinksIn(text) {
+  const found = String(text || '').match(URL_RE) || [];
+  const out = [];
+  for (const raw of found) {
+    const url = normalizeLink(raw.replace(/[.,;:!?)>\]]+$/, ''));
+    if (url && detectPlatform(url) !== 'Other' && !out.includes(url)) out.push(url);
+  }
+  return out.slice(0, 10);
+}
+
+async function inboundTick() {
+  const rows = await at.list(INBOUND.table, {
+    formula: `OR({${INBOUND.names.status}}="", {${INBOUND.names.status}}="New")`,
+    fields: Object.values(INBOUND.f),
+    maxRecords: 20,
+  });
+  for (const r of rows) {
+    try {
+      await handleInboundEmail(r);
+    } catch (err) {
+      log(`Inbound email ${r.id} failed: ${err.message}`);
+      await at.update(INBOUND.table, r.id, { [INBOUND.f.status]: 'Error', [INBOUND.f.result]: String(err.message).slice(0, 1000) }).catch(() => {});
+    }
+  }
+}
+
+async function handleInboundEmail(r) {
+  const f = r.fields;
+  const from = String(f[INBOUND.f.from] || '').trim().toLowerCase();
+  const done = (status, result) => at.update(INBOUND.table, r.id, { [INBOUND.f.status]: status, [INBOUND.f.result]: result.slice(0, 5000) });
+  const matches = from
+    ? await at.list(M.table, { formula: `AND(LOWER({${M.names.email}})=${at.q(from)}, {${M.names.approved}})`, fields: [...CREATOR_CONTACT_FIELDS(), M.f.commitments] })
+    : [];
+  if (!matches.length) return done('Not a creator', `No approved creator uses ${from || 'this address'}. Nothing was logged and no reply was sent.`);
+
+  // Campaigns that still need posts from this person (across duplicate profiles, if any).
+  const rowIds = [...new Set(matches.flatMap((m) => m.fields[M.f.commitments] || []))];
+  const rowsK = rowIds.length ? await listByIds(K.table, rowIds, KROW_POST_FIELDS()) : [];
+  const open = rowsK.filter((k) => k.fields[K.f.status] === 'Committed' && rowPostsRequired(k) > 0 && rowPostsAccepted(k) < rowPostsRequired(k));
+  const creator = matches.find((m) => (m.fields[M.f.commitments] || []).some((id) => open.some((k) => k.id === id))) || matches[0];
+  const name = (k) => first1(k.fields[K.f.campaignName]) || 'Campaign';
+  const reply = (subject, body) =>
+    queueRawEmail({ to: from, kind: 'Posts', subject, body: `${hi(creator.fields)}\n\n${body}${pageLine(creator.fields)}\n\nQuestions? Just reply to the Creator Congress team.` });
+
+  const text = `${f[INBOUND.f.subject] || ''}\n${f[INBOUND.f.body] || ''}`;
+  const links = postLinksIn(text);
+  if (!links.length) {
+    await reply('We couldn’t find a post link', 'Thanks for your email! We couldn’t find a link to a post in it. Please send the full link to your post (for example https://www.tiktok.com/@you/video/123), and we’ll log it for you.');
+    return done('No link found', 'Replied asking for a post link.');
+  }
+  if (!open.length) {
+    await reply('No campaigns waiting on posts', 'Thanks! We got your link, but none of your campaigns are waiting on posts right now, so nothing was logged. If this is a mistake, just reply and the team will sort it out.');
+    return done('Needs campaign', `Links: ${links.join(' ')}\nThis creator has no campaigns waiting on posts.`);
+  }
+  // Which campaign? Only one waiting → that one. Several → the one named in the subject or body.
+  const lower = text.toLowerCase();
+  const named = open.filter((k) => lower.includes(name(k).toLowerCase()));
+  const target = open.length === 1 ? open[0] : named.length === 1 ? named[0] : null;
+  if (!target) {
+    await reply(
+      'Which campaign is this post for?',
+      `Thanks for sending your post! You're on more than one campaign that needs posts, so we weren't sure which one it's for:\n\n${open.map((k) => `* ${name(k)}`).join('\n')}\n\nPlease send it again with the campaign name in the subject line, or submit it on your campaigns page.`
+    );
+    return done('Needs campaign', `Links: ${links.join(' ')}\nCouldn't tell which campaign: ${open.map(name).join(', ')}.`);
+  }
+
+  const shotUrl = String(f[INBOUND.f.attachments] || '').match(/https?:\/\/[^\s,]+/)?.[0];
+  const lines = [];
+  let logged = 0;
+  for (const [i, link] of links.entries()) {
+    const res = await submitPost({ krowId: target.id, link, via: 'Email', screenshot: i === 0 && shotUrl ? { url: shotUrl, filename: 'insights.png' } : null });
+    if (res.result === 'postreview' || res.result === 'postcounted') logged++;
+    lines.push(
+      `* ${link}: ` +
+        ({ postreview: 'logged, and sent to the partner to review', postcounted: 'logged', duplicate: 'already logged earlier', badlink: "that doesn't look like a working link", notconfirmed: "you're not confirmed on this campaign", noposts: "this campaign doesn't track posts" }[res.result] || res.result)
+    );
+  }
+  const after = (await listByIds(K.table, [target.id], KROW_POST_FIELDS()))[0] || target;
+  const progress = `${rowPostsAccepted(after)} of ${rowPostsRequired(after)} posts counted so far for ${name(target)}.`;
+  await reply(logged ? `Got it: post${logged === 1 ? '' : 's'} logged for ${name(target)}` : `About your post for ${name(target)}`, `Here's what happened with what you sent for **${name(target)}**:\n\n${lines.join('\n')}\n\n${progress}`);
+  log(`Inbound email ${r.id}: ${logged} post(s) logged for ${target.id} from ${from}`);
+  return done(logged ? 'Logged' : 'Needs campaign', `${name(target)}\n${lines.join('\n')}\n${progress}`);
 }
 
 // ---------- members & commitments ----------
@@ -4177,6 +4265,7 @@ async function poll() {
   try {
     await syncCampaignPosts();
     await backfillCommitmentDiscordIds();
+    await inboundTick();
     await normalizeJoinModes();
     await ensurePortalTokens();
     await syncInviteCampaigns();
