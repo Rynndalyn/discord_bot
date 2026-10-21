@@ -181,9 +181,8 @@ function scheduleRefresh(messageId, campaignId) {
         const [rec] = await at.list(C.table, { formula: `RECORD_ID()=${at.q(campaignId)}`, fields: Object.values(C.f) });
         if (!rec) return;
         if (!isInviteKey(messageId)) {
-          const channel = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
-          const msg = await channel.messages.fetch(messageId);
-          await msg.edit({ embeds: [buildEmbed(rec.fields, { closed: rec.fields[C.f.status] !== C.ACTIVE })] });
+          const msg = await fetchCampaignMessage(messageId);
+          if (msg) await msg.edit({ embeds: [buildEmbed(rec.fields, { closed: rec.fields[C.f.status] !== C.ACTIVE })] }).catch((err) => log(`Could not refresh post ${messageId}: ${err.message}`));
         }
         if (hasThread(rec.fields)) await syncCampaignChannel(rec);
       } catch (err) {
@@ -193,8 +192,105 @@ function scheduleRefresh(messageId, campaignId) {
   );
 }
 
+// ---------- the campaign channel: a regular text channel, or a Forum (one forum post per campaign) ----------
+// In a Forum, creators see a short list (title + tags) and click a campaign to open the full post.
+// The forum post's first message is the campaign card; its ID equals the forum post's ID.
+let campaignIsForum = false;
+async function campaignChannel() {
+  const ch = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
+  campaignIsForum = ch?.type === ChannelType.GuildForum;
+  return ch;
+}
+const postUrl = (messageId) =>
+  campaignIsForum ? `https://discord.com/channels/${DISCORD_GUILD_ID}/${messageId}` : `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${messageId}`;
+const postTitle = (f) => {
+  const pay = Number(f[C.f.creatorPay]) || 0;
+  return `${f[C.f.shortName] || 'Campaign'}${pay ? ` · ${money(pay)}` : ''}`.slice(0, 100);
+};
+
+// Tags creators can filter by: Paid/Unpaid, how to join, and up to 3 issues (Discord allows 5 per post, 20 per forum).
+const TAG_EMOJI = { Paid: '💰', Unpaid: '🤝', Open: '🟢', 'Partner-reviewed': '🙋' };
+async function forumTagsFor(forum, f) {
+  const wanted = [
+    Number(f[C.f.creatorPay]) > 0 ? 'Paid' : 'Unpaid',
+    modeOf(f) === 'review' ? 'Partner-reviewed' : 'Open',
+    ...(f[C.f.issues] || []).slice(0, 3),
+  ];
+  const have = new Map(forum.availableTags.map((t) => [t.name.toLowerCase(), t]));
+  const missing = wanted.filter((n) => !have.has(n.toLowerCase()));
+  if (missing.length && forum.availableTags.length < 20) {
+    const add = missing.slice(0, 20 - forum.availableTags.length).map((name) => ({ name: name.slice(0, 20), ...(TAG_EMOJI[name] ? { emoji: { id: null, name: TAG_EMOJI[name] } } : {}) }));
+    try {
+      await forum.setAvailableTags([...forum.availableTags.map((t) => ({ id: t.id, name: t.name, moderated: t.moderated, emoji: t.emoji })), ...add]);
+      const fresh = await client.channels.fetch(forum.id, { force: true });
+      fresh.availableTags.forEach((t) => have.set(t.name.toLowerCase(), t));
+    } catch (err) {
+      log(`Couldn't add forum tags: ${err.message}`);
+    }
+  }
+  return [...new Set(wanted.map((n) => have.get(n.toLowerCase())?.id).filter(Boolean))].slice(0, 5);
+}
+
+async function fetchCampaignMessage(messageId) {
+  if (!messageId || isInviteKey(messageId)) return null;
+  const ch = await campaignChannel().catch(() => null);
+  if (!ch) return null;
+  if (campaignIsForum) {
+    const thread = await client.channels.fetch(messageId).catch(() => null);
+    return thread ? thread.fetchStarterMessage().catch(() => null) : null;
+  }
+  return ch.messages.fetch(messageId).catch(() => null);
+}
+
+// Post a campaign card (a new forum post in a Forum, a message otherwise) and add the sign-up reaction.
+async function publishCampaignPost(rec) {
+  const ch = await campaignChannel();
+  let msg;
+  if (campaignIsForum) {
+    const thread = await ch.threads.create({
+      name: postTitle(rec.fields),
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+      message: { embeds: [buildEmbed(rec.fields)] },
+      appliedTags: await forumTagsFor(ch, rec.fields),
+    });
+    msg = await thread.fetchStarterMessage();
+  } else {
+    msg = await ch.send({ embeds: [buildEmbed(rec.fields)] });
+  }
+  await msg.react(SIGNUP_EMOJI);
+  return msg;
+}
+
+async function deleteCampaignPost(messageId) {
+  if (campaignIsForum) {
+    const thread = await client.channels.fetch(messageId).catch(() => null);
+    if (thread) await thread.delete().catch((err) => log(`Couldn't delete old forum post ${messageId}: ${err.message}`));
+    return;
+  }
+  const old = await fetchCampaignMessage(messageId);
+  if (old) await old.delete().catch((err) => log(`Couldn't delete old post ${messageId}: ${err.message}`));
+}
+
+// Forum posts: closed campaigns are locked and archived (they drop out of the main list); reopened ones come back.
+async function setForumPostOpen(messageId, open) {
+  if (!campaignIsForum || isInviteKey(messageId)) return;
+  const thread = await client.channels.fetch(messageId).catch(() => null);
+  if (!thread) return;
+  try {
+    if (open) {
+      if (thread.archived) await thread.setArchived(false);
+      if (thread.locked) await thread.setLocked(false);
+    } else {
+      if (!thread.locked) await thread.setLocked(true);
+      if (!thread.archived) await thread.setArchived(true);
+    }
+  } catch (err) {
+    log(`Couldn't ${open ? 'reopen' : 'close'} forum post ${messageId}: ${err.message}`);
+  }
+}
+
 async function syncCampaignPosts() {
-  const channel = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
+  const channel = await campaignChannel();
   const campaignFields = Object.values(C.f);
 
   // 1) New: Active + Post to Discord + not yet posted
@@ -203,8 +299,7 @@ async function syncCampaignPosts() {
     fields: campaignFields,
   });
   for (const rec of toPost) {
-    const msg = await channel.send({ embeds: [buildEmbed(rec.fields)] });
-    await msg.react(SIGNUP_EMOJI);
+    const msg = await publishCampaignPost(rec);
     await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false });
     campaignByMessage.set(msg.id, campaignInfo(rec));
     log(`Posted campaign ${rec.id} as message ${msg.id}`);
@@ -222,10 +317,8 @@ async function syncCampaignPosts() {
       await at.update(C.table, rec.id, { [C.f.repost]: false });
       continue; // invite-only campaigns have no public post
     }
-    const old = await channel.messages.fetch(oldId).catch(() => null);
-    if (old) await old.delete().catch((err) => log(`Couldn't delete old post ${oldId}: ${err.message}`));
-    const msg = await channel.send({ embeds: [buildEmbed(rec.fields)] });
-    await msg.react(SIGNUP_EMOJI);
+    await deleteCampaignPost(oldId);
+    const msg = await publishCampaignPost(rec);
     await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false, [C.f.repost]: false });
     // Move every sign-up to the new post. People who'd reacted on the old post are marked so the
     // reaction check doesn't withdraw them (their old reaction went away with the old post).
@@ -273,8 +366,11 @@ async function editPost(channel, rec, closed) {
   const messageId = rec.fields[C.f.discordMessageId];
   try {
     if (!isInviteKey(messageId)) {
-      const msg = await channel.messages.fetch(messageId);
+      if (!closed) await setForumPostOpen(messageId, true); // unarchive first so the card can be edited
+      const msg = await fetchCampaignMessage(messageId);
+      if (!msg) throw new Error('post not found');
       await msg.edit({ embeds: [buildEmbed(rec.fields, { closed })] });
+      if (closed) await setForumPostOpen(messageId, false);
     }
   } catch (err) {
     log(`Could not edit message ${messageId} for ${rec.id} (deleted?): ${err.message}`);
@@ -520,7 +616,7 @@ async function doSyncCampaignThread(rec) {
   }
 
   if (isNew) {
-    const postLink = `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${f[C.f.discordMessageId]}`;
+    const postLink = postUrl(f[C.f.discordMessageId]);
     const intro = await thread.send({
       embeds: [
         new EmbedBuilder()
@@ -570,6 +666,14 @@ async function sweepCampaignThreads() {
     fields: Object.values(C.f),
   });
   for (const rec of recs) await syncCampaignChannel(rec);
+  // Forum: Discord hides quiet forum posts after a week; keep every active campaign's post in the list.
+  if (campaignIsForum) {
+    const live = await at.list(C.table, {
+      formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.discordMessageId}}!="", NOT({${C.names.discordClosed}}))`,
+      fields: [C.f.discordMessageId],
+    });
+    for (const rec of live) await setForumPostOpen(rec.fields[C.f.discordMessageId], true);
+  }
 }
 
 // ---------- members & commitments ----------
@@ -654,7 +758,11 @@ async function resolveReaction(reaction, user) {
       return null;
     }
   }
-  if (reaction.message.channelId !== CAMPAIGN_CHANNEL_ID) return null;
+  if (reaction.message.channelId !== CAMPAIGN_CHANNEL_ID) {
+    // Forum: the reaction is inside a forum post whose parent is the campaign channel
+    const ch = reaction.message.channel ?? (await client.channels.fetch(reaction.message.channelId).catch(() => null));
+    if (ch?.parentId !== CAMPAIGN_CHANNEL_ID) return null;
+  }
   if (reaction.emoji.name !== SIGNUP_EMOJI) return null;
   const campaign = await getCampaignForMessage(reaction.message.id);
   if (campaign) return { campaign, messageId: reaction.message.id };
@@ -735,7 +843,6 @@ client.on('messageReactionRemove', async (reaction, user) => {
 // ---------- catch-up: reconcile reactions that happened while the bot was offline ----------
 
 async function reconcileOpenCampaigns() {
-  const channel = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
   const open = await at.list(C.table, {
     formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.discordMessageId}}!="")`,
     fields: [C.f.shortName, C.f.discordMessageId, C.f.status, C.f.requiresApproval, C.f.joinMode, C.f.orgName],
@@ -745,10 +852,8 @@ async function reconcileOpenCampaigns() {
     if (isInviteKey(messageId)) continue; // invite-only: no public post to reconcile
     const campaign = campaignInfo(rec);
     campaignByMessage.set(messageId, campaign);
-    let msg;
-    try {
-      msg = await channel.messages.fetch(messageId);
-    } catch {
+    const msg = await fetchCampaignMessage(messageId);
+    if (!msg) {
       log(`Reconcile: message ${messageId} not found for ${rec.id}`);
       continue;
     }
@@ -937,9 +1042,8 @@ async function applyDecision(req, camp, approve, reviewer) {
   } else {
     // Quietly remove their reaction so the post reflects reality (the remove event is ignored for Declined).
     try {
-      const ch = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
-      const msg = await ch.messages.fetch(messageId);
-      await msg.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI)?.users.remove(req.fields[K.f.discordUserId]);
+      const msg = await fetchCampaignMessage(messageId);
+      await msg?.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI)?.users.remove(req.fields[K.f.discordUserId]);
     } catch {
       /* post gone or no permission */
     }
@@ -1779,9 +1883,8 @@ async function webLeave(creator, camp, mine) {
   const did = existing.fields[K.f.discordUserId];
   if (isSnowflake(did) && !isInviteKey(key)) {
     try {
-      const ch = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
-      const msg = await ch.messages.fetch(key);
-      await msg.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI)?.users.remove(did);
+      const msg = await fetchCampaignMessage(key);
+      await msg?.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI)?.users.remove(did);
     } catch {
       /* ignore */
     }
@@ -3457,7 +3560,7 @@ async function handleMyCampaigns(interaction) {
     const org = first(r.fields[K.f.orgName]);
     const end = fmtDate(first(r.fields[K.f.campaignEndDate]));
     const key = r.fields[K.f.discordMessageId];
-    const link = `https://discord.com/channels/${DISCORD_GUILD_ID}/${CAMPAIGN_CHANNEL_ID}/${key}`;
+    const link = postUrl(key);
     const details = [pay(r) ? money(pay(r)) : null, org, end ? `${isActive ? 'ends' : 'ended'} ${end}` : null].filter(Boolean);
     const title = isInviteKey(key) ? `**${name}** ✉️` : `**[${name}](${link})**`;
     const contact = r.fields[K.f.status] === 'Committed' ? String(first(r.fields[K.f.leadContact]) || '').trim() : '';
@@ -3781,8 +3884,8 @@ client.once('clientReady', async () => {
   const guild = client.guilds.cache.get(DISCORD_GUILD_ID);
   log(guild ? `Found server: ${guild.name}` : `WARNING: bot is not in server ${DISCORD_GUILD_ID}. Check DISCORD_GUILD_ID or re-invite the bot.`);
   try {
-    const ch = await client.channels.fetch(CAMPAIGN_CHANNEL_ID);
-    log(`Found campaign channel: #${ch.name}`);
+    const ch = await campaignChannel();
+    log(`Found campaign channel: #${ch.name}${campaignIsForum ? ' (Forum: one post per campaign)' : ''}`);
   } catch (err) {
     log(`WARNING: can't open campaign channel ${CAMPAIGN_CHANNEL_ID}: ${err.message}. Check CAMPAIGN_CHANNEL_ID and the bot's channel permissions.`);
   }
