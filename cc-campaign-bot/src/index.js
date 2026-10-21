@@ -426,6 +426,8 @@ async function refreshPost(rec) {
     await msg.edit({ embeds: [embed] });
     // Switched sign-up emoji? Put the new one on older posts (✅ reactions there still count).
     if (msg.react && ![...(msg.reactions?.cache?.values?.() || [])].some((r) => isMainSignup(r.emoji) && r.me)) await msg.react(SIGNUP.react).catch((err) => log(`Couldn't add sign-up emoji: ${err.message}`));
+    // ...and take the bot's own old ✅ off, so the new emoji is the one people see (their ✅ reactions stay and count).
+    if (SIGNUP.id) for (const r of [...(msg.reactions?.cache?.values?.() || [])]) if (r.emoji.name === '✅' && r.me) await r.users.remove(client.user.id).catch(() => {});
     if (campaignIsForum) {
       const thread = await client.channels.fetch(messageId).catch(() => null);
       if (thread && (thread.name !== postTitle(rec.fields) || String([...thread.appliedTags].sort()) !== String([...tags].sort()))) {
@@ -4422,6 +4424,7 @@ async function syncGuideChannel(ch, items) {
 
 client.once('clientReady', async () => {
   log(`Logged in as ${client.user.tag}`);
+  log(`Sign-up emoji: ${SIGNUP.show}${SIGNUP.id ? ' (custom server emoji)' : String(SIGNUP_EMOJI).includes(':') ? ' (WARNING: SIGNUP_EMOJI looks like a custom emoji but isn\'t in <:name:id> form, so it was not used)' : ''}`);
   syncDiscordGuide().catch((err) => log(`Couldn't update the Discord guide: ${err.message}`));
   const guild = client.guilds.cache.get(DISCORD_GUILD_ID);
   log(guild ? `Found server: ${guild.name}` : `WARNING: bot is not in server ${DISCORD_GUILD_ID}. Check DISCORD_GUILD_ID or re-invite the bot.`);
