@@ -26,6 +26,7 @@ import {
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import * as at from './airtable.js';
+import { guideHtml } from './guide.js';
 import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS } from './schema.js';
 
 const {
@@ -2176,6 +2177,10 @@ function startWebServer() {
     try {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
+      // Public how-to guide (shareable): the site root and /guide
+      if (url.pathname === '/' || /^\/guide\/?$/.test(url.pathname)) {
+        return send(res, 200, guideHtml({ css: PAGE_CSS, brand: brandHtml(), discordInvite: process.env.DISCORD_INVITE_URL || '' }));
+      }
       // Partner page: review a submitted post
       const pr = url.pathname.match(/^\/o\/([a-f0-9]{32})\/post\/(rec[A-Za-z0-9]{14})\/(approve|changes)\/?$/);
       if (pr && req.method === 'POST') {
@@ -3841,7 +3846,8 @@ async function handleHelp(interaction) {
       { name: '🔒  Good to know', value: 'Reactions are public. Command replies are private to you. Closed campaigns don’t take sign-ups.' }
     )
     .setFooter({ text: 'Questions? Message a Creator Congress team member.' });
-  if (GUIDE_URL) e.addFields({ name: '📄  Full guide', value: `[Read the full how-to guide](${GUIDE_URL})` });
+  const guide = GUIDE_URL || (publicBase() ? `${publicBase()}/guide` : '');
+  if (guide) e.addFields({ name: '📄  Full guide', value: `[Read the full how-to guide](${guide})` });
   return interaction.editReply({ embeds: [e] });
 }
 
