@@ -63,6 +63,19 @@ const client = new Client({
 });
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
+// Sign-up emoji. A normal emoji (✅) or a custom server emoji: set SIGNUP_EMOJI to <:name:id> (type \:name: in
+// Discord to get it). ✅ keeps working as a sign-up too, so reactions made before a switch still count.
+const SIGNUP_CUSTOM = String(SIGNUP_EMOJI).trim().match(/^<?a?:?([\w~]+):(\d{17,20})>?$/);
+const SIGNUP = SIGNUP_CUSTOM
+  ? { id: SIGNUP_CUSTOM[2], name: SIGNUP_CUSTOM[1], react: SIGNUP_CUSTOM[2], show: `<:${SIGNUP_CUSTOM[1]}:${SIGNUP_CUSTOM[2]}>`, img: `https://cdn.discordapp.com/emojis/${SIGNUP_CUSTOM[2]}.png?size=64` }
+  : { id: null, name: String(SIGNUP_EMOJI).trim(), react: String(SIGNUP_EMOJI).trim(), show: String(SIGNUP_EMOJI).trim(), img: '' };
+const isSignupEmoji = (e) => !!e && ((SIGNUP.id && e.id === SIGNUP.id) || (!SIGNUP.id && e.name === SIGNUP.name) || e.name === '✅');
+const isMainSignup = (e) => !!e && (SIGNUP.id ? e.id === SIGNUP.id : e.name === SIGNUP.name);
+const signupReactions = (msg) => [...(msg?.reactions?.cache?.values?.() || [])].filter((r) => isSignupEmoji(r.emoji));
+async function removeSignupReaction(msg, userId) {
+  for (const r of signupReactions(msg)) await r.users.remove(userId).catch(() => {});
+}
 const now = () => new Date().toISOString();
 const isSnowflake = (s) => /^\d{17,20}$/.test(String(s));
 
@@ -147,7 +160,7 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
     { name: '💰 Pay', value: pay ? `${money(pay)}` : 'Unpaid / TBD', inline: true },
     {
       name: '👥 Spots',
-      value: (needed ? `${signups} of ${needed} filled\n${progressBar(signups, needed)}` : `${signups} signed up`) + '\n*Includes creators who joined on the web, so it can be higher than the ✅ count.*',
+      value: (needed ? `${signups} of ${needed} filled\n${progressBar(signups, needed)}` : `${signups} signed up`) + '\n*Includes creators who joined on the web, so it can be higher than the ' + SIGNUP.show + ' count.*',
       inline: true,
     },
     { name: '📅 Dates', value: start && end ? `${start} –\n${end}` : start || end || 'Flexible', inline: true }
@@ -170,7 +183,7 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
       ? '**Sign-ups are closed.** Thanks to everyone who joined!'
       : invite
         ? `**You've been personally invited to this campaign.** Use the buttons below to accept or pass.\nType \`/mycampaigns\` in the server to see everything you've joined.`
-        : `**React ${SIGNUP_EMOJI} below to sign up.** Remove your reaction to withdraw.\nType \`/mycampaigns\` to see everything you've joined.`,
+        : `**React ${SIGNUP.show} below to sign up.** Remove your reaction to withdraw.\nType \`/mycampaigns\` to see everything you've joined.`,
   });
   e.setFooter({ text: 'Creator Congress' });
   return e;
@@ -264,7 +277,7 @@ async function publishCampaignPost(rec) {
   } else {
     msg = await ch.send({ embeds: [buildEmbed(rec.fields)] });
   }
-  await msg.react(SIGNUP_EMOJI);
+  await msg.react(SIGNUP.react);
   return msg;
 }
 
@@ -411,6 +424,8 @@ async function refreshPost(rec) {
     }
     if (!msg) return;
     await msg.edit({ embeds: [embed] });
+    // Switched sign-up emoji? Put the new one on older posts (✅ reactions there still count).
+    if (msg.react && ![...(msg.reactions?.cache?.values?.() || [])].some((r) => isMainSignup(r.emoji) && r.me)) await msg.react(SIGNUP.react).catch((err) => log(`Couldn't add sign-up emoji: ${err.message}`));
     if (campaignIsForum) {
       const thread = await client.channels.fetch(messageId).catch(() => null);
       if (thread && (thread.name !== postTitle(rec.fields) || String([...thread.appliedTags].sort()) !== String([...tags].sort()))) {
@@ -947,7 +962,7 @@ async function resolveReaction(reaction, user) {
     const ch = reaction.message.channel ?? (await client.channels.fetch(reaction.message.channelId).catch(() => null));
     if (ch?.parentId !== CAMPAIGN_CHANNEL_ID) return null;
   }
-  if (reaction.emoji.name !== SIGNUP_EMOJI) return null;
+  if (!isSignupEmoji(reaction.emoji)) return null;
   const campaign = await getCampaignForMessage(reaction.message.id);
   if (campaign) return { campaign, messageId: reaction.message.id };
   // A bot post whose campaign was deleted or replaced in Airtable: tell people instead of ignoring them.
@@ -1003,7 +1018,7 @@ client.on('messageReactionAdd', async (reaction, user) => {
       ? '\n\nOne more thing: your Discord account isn\'t linked to your Creator Congress profile yet. Run `/link` with the email you applied with, in the server, so partners can see your profile.'
       : '';
     if (changed && pending) {
-      await dm(user, `🙋 Your request to join **${hit.campaign.name}** is in! ${hit.campaign.org} reviews each sign-up for this campaign, and we'll DM you as soon as you're confirmed. Remove your ${SIGNUP_EMOJI} anytime to cancel.${linkNote}`);
+      await dm(user, `🙋 Your request to join **${hit.campaign.name}** is in! ${hit.campaign.org} reviews each sign-up for this campaign, and we'll DM you as soon as you're confirmed. Remove your ${SIGNUP.show} anytime to cancel.${linkNote}`);
     } else if (changed) {
       const campFields = await campaignFieldsById(hit.campaign.id);
       if (campFields) await announceConfirmed({ campFields, user, headline: `✅ You're signed up for **${hit.campaign.name}**!`, extra: linkNote });
@@ -1041,9 +1056,8 @@ async function reconcileOpenCampaigns() {
       log(`Reconcile: message ${messageId} not found for ${rec.id}`);
       continue;
     }
-    const reaction = msg.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI);
     const reactors = new Map();
-    if (reaction) {
+    for (const reaction of signupReactions(msg)) {
       let after;
       for (;;) {
         const batch = await reaction.users.fetch({ limit: 100, after });
@@ -1060,7 +1074,7 @@ async function reconcileOpenCampaigns() {
     for (const [id, u] of reactors) {
       if (recordedIds.has(id)) continue;
       const res = await commit(u, messageId, campaign);
-      if (res.declined) await reaction.users.remove(id).catch(() => {});
+      if (res.declined) await removeSignupReaction(msg, id);
     }
     for (const r of recorded) {
       const uid = r.fields[K.f.discordUserId];
@@ -1229,7 +1243,7 @@ async function applyDecision(req, camp, approve, reviewer) {
     // Quietly remove their reaction so the post reflects reality (the remove event is ignored for Declined).
     try {
       const msg = await fetchCampaignMessage(messageId);
-      await msg?.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI)?.users.remove(req.fields[K.f.discordUserId]);
+      await removeSignupReaction(msg, req.fields[K.f.discordUserId]);
     } catch {
       /* post gone or no permission */
     }
@@ -2083,7 +2097,7 @@ async function webLeave(creator, camp, mine) {
   if (isSnowflake(did) && !isInviteKey(key)) {
     try {
       const msg = await fetchCampaignMessage(key);
-      await msg?.reactions.cache.find((r) => r.emoji.name === SIGNUP_EMOJI)?.users.remove(did);
+      await removeSignupReaction(msg, did);
     } catch {
       /* ignore */
     }
@@ -2412,7 +2426,7 @@ async function discordCallback(res, url) {
     const user = await client.users.fetch(me.id).catch(() => null);
     await user?.send(
       st.k === 'c'
-        ? `👋 Welcome to Creator Congress! Your account is linked.\n\n• Browse campaigns in <#${CAMPAIGN_CHANNEL_ID}> and react ${SIGNUP_EMOJI} to join.\n• \`/mycampaigns\` shows everything you're on.\n• You'll be added to the private thread for each campaign you're confirmed on.`
+        ? `👋 Welcome to Creator Congress! Your account is linked.\n\n• Browse campaigns in <#${CAMPAIGN_CHANNEL_ID}> and react ${SIGNUP.show} to join.\n• \`/mycampaigns\` shows everything you're on.\n• You'll be added to the private thread for each campaign you're confirmed on.`
         : `👋 Welcome to Creator Congress! You're linked to your organization. You'll be added to your organization's private channel and campaign threads in a minute or two. Try \`/roster\` and \`/review\`.`
     ).catch(() => {});
     return back(joinedNow ? 'discordjoined' : 'discordlinked');
@@ -2473,7 +2487,7 @@ function startWebServer() {
       if (url.pathname === '/discord/callback') return discordCallback(res, url);
       // Public how-to guide (shareable): the site root and /guide
       if (url.pathname === '/' || /^\/guide\/?$/.test(url.pathname)) {
-        return send(res, 200, guideHtml({ css: PAGE_CSS, brand: brandHtml(), discordInvite: process.env.DISCORD_INVITE_URL || '' }));
+        return send(res, 200, guideHtml({ css: PAGE_CSS, brand: brandHtml(), discordInvite: process.env.DISCORD_INVITE_URL || '', signup: SIGNUP.img ? `<img src="${SIGNUP.img}" alt="sign-up emoji" class="emo">` : SIGNUP.show }));
       }
       // Partner page: review a submitted post
       const pr = url.pathname.match(/^\/o\/([a-f0-9]{32})\/post\/(rec[A-Za-z0-9]{14})\/(approve|changes)\/?$/);
@@ -3950,7 +3964,7 @@ async function handleMyCampaigns(interaction) {
   const invitations = rows.filter((r) => r.fields[K.f.status] === 'Invited' && (Array.isArray(r.fields[K.f.campaignStatus]) ? r.fields[K.f.campaignStatus][0] : r.fields[K.f.campaignStatus]) === C.ACTIVE);
   rows = rows.filter((r) => r.fields[K.f.status] === 'Committed');
   if (!rows.length && !awaiting.length && !invitations.length) {
-    return interaction.editReply(`You haven't signed up for any campaigns yet. React ${SIGNUP_EMOJI} on a post in <#${CAMPAIGN_CHANNEL_ID}> to join one.`);
+    return interaction.editReply(`You haven't signed up for any campaigns yet. React ${SIGNUP.show} on a post in <#${CAMPAIGN_CHANNEL_ID}> to join one.`);
   }
   const first = (v) => (Array.isArray(v) ? v[0] : v);
   const pay = (r) => {
@@ -4165,9 +4179,9 @@ async function handleHelp(interaction) {
     .setDescription(`Partner organizations post campaigns in <#${CAMPAIGN_CHANNEL_ID}>. Here's everything you need.`)
     .addFields(
       { name: '1️⃣  Link your account (one time)', value: 'Type `/link your@email.com` using the email you applied with.' },
-      { name: `2️⃣  Sign up`, value: `React ${SIGNUP_EMOJI} on any campaign in <#${CAMPAIGN_CHANNEL_ID}>. Remove your reaction to withdraw.` },
+      { name: `2️⃣  Sign up`, value: `React ${SIGNUP.show} on any campaign in <#${CAMPAIGN_CHANNEL_ID}>. Remove your reaction to withdraw.` },
       { name: '3️⃣  Track your campaigns', value: 'Type `/mycampaigns` to see what you joined and your expected pay (an estimate, not a confirmed payment).' },
-      { name: '🙋  Partner-reviewed campaigns', value: 'Some campaigns are reviewed by the partner. Your ✅ is a request, and you get a DM once you’re confirmed.' },
+      { name: '🙋  Partner-reviewed campaigns', value: `Some campaigns are reviewed by the partner. Your ${SIGNUP.show} is a request, and you get a DM once you’re confirmed.` },
       { name: '✉️  Invitations', value: 'Some campaigns are invite-only. If you’re invited, you’ll get a DM with Accept / No thanks buttons (also in `/mycampaigns`).' },
       { name: '📝  Submitting posts', value: 'If a campaign asks for posts, type `/submit` with your post link (add a screenshot of its insights if you can). You’ll see your progress in `/mycampaigns`. Payment comes due once all your posts are in.' },
       { name: '💸  Getting paid', value: 'Your contact and payment details appear once you’re confirmed. After a partner marks you paid, you’ll get a DM to confirm it arrived. A payment only counts as **Paid** once you confirm it (or 14 days pass with no reply). Not paid? Tap **Not yet** and we’ll follow up.' },
@@ -4292,6 +4306,7 @@ function guideEmbed(item) {
   const guideUrl = GUIDE_URL || (publicBase() ? `${publicBase()}/guide` : '');
   const body = item.body
     .replaceAll('{campaigns}', `<#${CAMPAIGN_CHANNEL_ID}>`)
+    .replaceAll('{signup}', SIGNUP.show)
     .replaceAll('{guide}', guideUrl || 'the campaigns page');
   return new EmbedBuilder().setAuthor({ name: 'CREATOR CONGRESS · HOW IT WORKS' }).setTitle(item.title.slice(0, 256)).setColor(0xe6287e).setDescription(body.slice(0, 4096));
 }
