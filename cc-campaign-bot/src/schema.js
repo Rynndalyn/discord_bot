@@ -250,3 +250,19 @@ export const ANALYSIS = {
     other: { link: 'fldeWQXBvjrEJEqWa', views: 'fld9FqCHiaOJlvRbQ', likes: 'fldIAeeiugd0boz3S', comments: 'fld7QgRGMLdsRPxtw', shares: 'fldqpp5DgW8njLU3C' },
   },
 };
+
+// Inbound Email: post links creators email to hello@creatorcongress.net (Gmail filter → Airtable automation adds rows)
+export const INBOUND = {
+  table: 'tblplaSw32ZFbfQ1i',
+  f: {
+    subject: 'fldmlyn4A7HVtQgq2',
+    from: 'fldE5takf4qJnOv75',
+    fromName: 'fldYRQnwXtFrkzEYh',
+    body: 'fldu6tp4IoeTEbVxC',
+    attachments: 'fldJGEAHZG7249CuU',
+    received: 'fldM1Mxwul86f5vks',
+    status: 'fld6RQXbvD7DrHcr5', // blank/New → Logged / Needs campaign / No link found / Not a creator / Error
+    result: 'fldrh56JPKc7ydzkh',
+  },
+  names: { status: 'Status' },
+};
