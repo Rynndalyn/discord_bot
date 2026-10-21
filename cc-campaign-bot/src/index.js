@@ -1043,10 +1043,12 @@ async function notifyReviewers(recordId, { reminder = false } = {}) {
       const u = await client.users.fetch(id);
       await u.send({ embeds: [embed], components: [row] });
       delivered++;
-    } catch {
-      /* DMs closed */
+    } catch (err) {
+      // 50007 = they've turned off DMs from server members (or don't share a server with the bot)
+      log(`Review request ${recordId}: couldn't DM org contact ${id}${err.code === 50007 ? ' (their DMs are closed to this server)' : ''}: ${err.message}`);
     }
   }
+  log(`Review request ${recordId}: sent to ${delivered} of ${contacts.length} org contact(s)${REVIEW_CHANNEL_ID ? ' + staff review channel' : ''}`);
   if (REVIEW_CHANNEL_ID && (!reminder || !delivered)) {
     try {
       const ch = await client.channels.fetch(REVIEW_CHANNEL_ID);
@@ -2005,6 +2007,7 @@ const PAGE_CSS = `
 :root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
 @media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
 body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}a:hover{color:var(--accent2)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 .wrap{max-width:720px;margin:0 auto;padding:24px 16px 64px}
 header h1{font-size:26px;margin:4px 0 2px}header p{margin:0;color:var(--muted)}
