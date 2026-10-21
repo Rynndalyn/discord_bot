@@ -169,10 +169,15 @@ code{background:var(--soft);color:var(--violet);padding:1px 6px;border-radius:6p
 `;
 
 // ---------- The same guide inside Discord ----------
-// The bot keeps one post per topic in the channel set by GUIDE_CHANNEL_ID (a Forum works best), creating any that are
-// missing and updating any whose text changed here. {guide} becomes the guide page link, {campaigns} the campaigns channel.
+// The bot keeps one post per topic in the channel set by GUIDE_CHANNEL_ID (a text channel, or a Forum), creating any
+// that are missing and updating any whose text changed here. To give a topic its own channel (e.g. for Discord
+// Onboarding resource pages), set GUIDE_CHANNELS like start:123,paid:456 using the keys below, or set
+// GUIDE_RESOURCES=true and the bot makes a read-only channel per topic (named below) under a Resources category. {guide} becomes the guide page link, {campaigns} the campaigns channel.
 export const DISCORD_GUIDE = [
   {
+    key: 'start',
+    channel: 'start-here',
+    about: 'Start here: link your account, turn on DMs and find your campaigns page.',
     title: '🚀 Start here: get set up',
     pin: true,
     body: `**Welcome to Creator Congress campaigns!** Partner organizations post paid and volunteer campaigns, and creators join, post and get paid. Three things to do once:
@@ -190,6 +195,9 @@ Then head to {campaigns} to find your first campaign. The other posts here walk 
 📄 Full guide: {guide}`,
   },
   {
+    key: 'join',
+    channel: 'how-to-join',
+    about: 'How to find and join campaigns, and what Open, Partner-reviewed and Invite-only mean.',
     title: '✅ How to join a campaign',
     body: `Every open campaign has its own post in {campaigns}. Use the tags at the top to filter, and click a post for the full brief.
 
@@ -205,6 +213,9 @@ Then head to {campaigns} to find your first campaign. The other posts here walk 
 📄 {guide}#c-join`,
   },
   {
+    key: 'confirmed',
+    channel: 'after-youre-confirmed',
+    about: 'Your private campaign thread, lead contact and payment details.',
     title: "🤝 After you're confirmed",
     body: `Once you're confirmed:
 
@@ -215,6 +226,9 @@ Then head to {campaigns} to find your first campaign. The other posts here walk 
 📄 {guide}#c-confirmed`,
   },
   {
+    key: 'posts',
+    channel: 'submitting-posts',
+    about: 'How to log your posts with /submit and what happens when an org reviews them.',
     title: '📝 How to submit your posts',
     body: `If a campaign asks for posts, log each one as soon as it's live.
 
@@ -227,6 +241,9 @@ You can also submit from your campaigns page. Check your progress (like *2 of 3 
 📄 {guide}#c-posts`,
   },
   {
+    key: 'paid',
+    channel: 'getting-paid',
+    about: "When payment is due, how to confirm it arrived, and what to do if it didn't.",
     title: '💸 How you get paid',
     body: `⏳ Not due yet → 📝 Waiting on posts → 💸 Payment due → 🏢 Org says paid → ✅ Paid
 
@@ -239,6 +256,9 @@ Pay shown in \`/mycampaigns\` is an estimate until the org confirms.
 📄 {guide}#c-paid`,
   },
   {
+    key: 'commands',
+    channel: 'commands',
+    about: 'Every Creator Congress command for creators and partner orgs.',
     title: '⌨️ Commands',
     body: `**For creators**
 \`/link\` – connect your Discord to your profile (one time)
@@ -257,6 +277,9 @@ Command replies are private to you. Reactions on campaign posts are public.
 📄 {guide}`,
   },
   {
+    key: 'partners',
+    channel: 'for-partners',
+    about: 'For partner organizations: choosing creators, reviewing posts and paying creators.',
     title: '🏢 For partner organizations',
     body: `**Your partner page.** Approved orgs get an email with a private partner page link. From it you can review requests, find and invite creators, review posts and mark creators paid, no Discord needed. Treat the link like a password.
 
@@ -273,6 +296,9 @@ Command replies are private to you. Reactions on campaign posts are public.
 📄 {guide}#partners`,
   },
   {
+    key: 'help',
+    channel: 'need-help',
+    about: 'Where to ask questions and get help.',
     title: '🆘 Need help?',
     body: `• **About a campaign:** ask in that campaign's post, or in your private campaign thread once you're confirmed.
 • **About payment or anything personal:** use your private thread, or message a Creator Congress team member.
