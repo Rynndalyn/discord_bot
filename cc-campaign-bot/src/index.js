@@ -3076,7 +3076,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
   const ids = org.fields[O.f.proposals] || [];
   const props = ids.length ? await listByIds(C.table, ids, Object.values(C.f)) : [];
   const rowIds = [...new Set(props.flatMap((p) => p.fields[C.f.commitments] || []))];
-  const rows = (rowIds.length ? await listByIds(K.table, rowIds, PAY_FIELDS()) : []).filter((r) => r.fields[K.f.status] === 'Committed');
+  const rows = (rowIds.length ? await listByIds(K.table, rowIds, [...PAY_FIELDS(), K.f.postsDueBy]) : []).filter((r) => r.fields[K.f.status] === 'Committed');
   props.sort((a, b) => (b.fields[C.f.status] === C.ACTIVE) - (a.fields[C.f.status] === C.ACTIVE));
   const orgPostIds = [...new Set(props.flatMap((p) => p.fields[C.f.posts] || []))];
   const orgPosts = orgPostIds.length ? await listByIds(POSTS.table, orgPostIds, POST_FIELDS()) : [];
@@ -3090,13 +3090,30 @@ async function renderOrgPage(org, token, flash, opts = {}) {
   <details class="notpaid"><summary>Ask for changes</summary><form method="post" action="/o/${token}/post/${p.id}/changes"><textarea name="note" rows="2" maxlength="500" required placeholder="What needs to change?"></textarea><button>Send to creator</button></form></details></div>`)
         .join('')
     : '';
-  const postLine = (r) => {
+  // Post progress for one creator: done / waiting on you / needs changes / not started, plus overdue.
+  const postInfo = (r) => {
     const required = rowPostsRequired(r);
-    if (!required) return '';
     const mineP = orgPosts.filter((p) => (p.fields[POSTS.f.commitment] || []).includes(r.id));
+    const by = (st) => mineP.filter((p) => p.fields[POSTS.f.status] === st).length;
+    const due = String(first1(r.fields[K.f.postsDueBy]) || '').slice(0, 10);
+    const accepted = rowPostsAccepted(r);
+    return { required, mineP, accepted, waiting: by('Submitted'), changes: by('Needs changes'), due, done: required > 0 && accepted >= required, late: !!due && due < todayEt() && accepted < required };
+  };
+  const postLine = (r) => {
+    const i = postInfo(r);
+    if (!i.required) return '';
     const icon = { Approved: '✅', Submitted: '⏳', 'Needs changes': '✏️' };
-    const links = mineP.map((p) => `<a href="${esc(p.fields[POSTS.f.link])}" target="_blank" rel="noopener" title="${esc(p.fields[POSTS.f.status] || '')}">${icon[p.fields[POSTS.f.status]] || '•'} ${esc(p.fields[POSTS.f.platform] || 'post')}</a>`);
-    return `<div class="muted">📝 Posts ${rowPostsAccepted(r)} of ${required}${links.length ? ` · ${links.join(' · ')}` : ''}</div>`;
+    const links = i.mineP.map((p) => `<a href="${esc(p.fields[POSTS.f.link])}" target="_blank" rel="noopener" title="${esc(p.fields[POSTS.f.status] || '')}">${icon[p.fields[POSTS.f.status]] || '•'} ${esc(p.fields[POSTS.f.platform] || 'post')}</a>`);
+    const status = i.done
+      ? '<span class="paystat paid">✅ All posts in</span>'
+      : !i.mineP.length
+        ? `<span class="paystat${i.late ? ' issue' : ''}">${i.late ? '⚠️ No posts yet, past due' : '⏳ No posts submitted yet'}</span>`
+        : [
+            i.waiting ? `<span class="paystat paymentdue">${i.waiting} waiting for your review</span>` : '',
+            i.changes ? `<span class="paystat">${i.changes} sent back for changes</span>` : '',
+            i.late ? '<span class="paystat issue">⚠️ past due</span>' : '',
+          ].filter(Boolean).join(' · ');
+    return `<div class="muted">📝 Posts ${i.accepted} of ${i.required}${i.due && !i.done ? ` (due ${esc(fmtDate(i.due))})` : ''} · ${status}${links.length ? `<br>${links.join(' · ')}` : ''}</div>`;
   };
   const paidRows = rows.filter((r) => isPaidCampaignRow(r));
   const tot = (s) => paidRows.filter((r) => payStatusOf(r) === s).reduce((t, r) => t + rowAmount(r), 0);
@@ -3186,7 +3203,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
         return `<span class="tag">${esc(profiles.get(id)?.[M.f.fullName] || 'Creator')} · ${label}</span>`;
       });
       return `<h2>✨ Suggested creators: ${esc(p.fields[C.f.shortName] || 'Campaign')}</h2>
-  <p class="muted">Invite-only. Best matches first, based on shared issues, location and reach. Nobody is invited until you click Invite.</p>
+  <p class="muted">${modeOf(p.fields) === 'invite' ? 'Invite-only. ' : ''}Best matches first, based on shared issues, location and reach. Nobody is invited until you click Invite.</p>
   ${invitedList.length ? `<p class="muted">Already invited:</p><div class="tags">${invitedList.join('')}</div>` : ''}
   ${sugg.length ? sugg.map((id) => {
         const cf = profiles.get(id);
@@ -3226,7 +3243,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
             .join('')
         : '<p class="empty">No confirmed creators yet.</p>';
       return `<div class="card"><h3>${esc(f[C.f.shortName] || 'Campaign')}</h3>
-  <div class="meta"><span>${f[C.f.status] === C.ACTIVE ? '🟢 Active' : '⚪ Closed'}</span><span>💰 ${f[C.f.creatorPay] ? esc(money(Number(f[C.f.creatorPay]))) + ' per creator' : 'Unpaid / TBD'}</span>${f[C.f.endDate] ? `<span>📅 ends ${esc(fmtDate(f[C.f.endDate]))}</span>` : ''}<span>👥 ${mine.length} confirmed</span></div>
+  <div class="meta"><span>${f[C.f.status] === C.ACTIVE ? '🟢 Active' : '⚪ Closed'}</span><span>💰 ${f[C.f.creatorPay] ? esc(money(Number(f[C.f.creatorPay]))) + ' per creator' : 'Unpaid / TBD'}</span>${f[C.f.endDate] ? `<span>📅 ends ${esc(fmtDate(f[C.f.endDate]))}</span>` : ''}<span>👥 ${mine.length} confirmed</span>${postsRequiredOf(f) && mine.length ? `<span>📝 ${mine.filter((r) => postInfo(r).done).length} of ${mine.length} finished posting${mine.some((r) => postInfo(r).late) ? ` · ⚠️ ${mine.filter((r) => postInfo(r).late).length} past due` : ''}</span>` : ''}</div>
   ${list}</div>`;
     })
     .join('');
@@ -3663,8 +3680,17 @@ function postsHtml(krow, posts, token) {
     .join('');
   const pct = Math.min(100, Math.round((accepted / required) * 100));
   const done = accepted >= required;
+  const waiting = mine.filter((p) => p.fields[POSTS.f.status] === 'Submitted').length;
+  const late = !!due && due < todayEt() && !done;
+  const left = required - accepted - waiting;
+  const status = done
+    ? ''
+    : !mine.length
+      ? `<p class="muted">${late ? '⚠️ Your posts are past due. Submit them below as soon as you can.' : 'You haven’t submitted any posts yet.'}</p>`
+      : `<p class="muted">${waiting ? `⏳ ${waiting} waiting for the partner to review. ` : ''}${left > 0 ? `${left} more to submit.` : ''}${late ? ' ⚠️ Past due.' : ''}</p>`;
   return `<div class="posts"><div class="contact-h">📝 Posts · ${accepted} of ${required} done${due && !done ? ` · due ${esc(fmtDate(due))}` : ''}</div>
   <div class="bar"><i style="width:${pct}%"></i></div>
+  ${status}
   ${list ? `<ul class="postlist">${list}</ul>` : ''}
   ${done ? '<p class="muted">All your posts are in. Thank you! 🎉</p>' : `<form method="post" action="/c/${token}/post/${krow.id}" class="postform" data-shot>
     <input name="link" type="url" placeholder="Paste your post link (TikTok, Instagram, YouTube…)" required>
