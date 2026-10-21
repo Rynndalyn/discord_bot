@@ -4144,16 +4144,75 @@ const sameEmbed = (msg, embed) => {
 };
 
 async function syncDiscordGuide() {
-  const id = process.env.GUIDE_CHANNEL_ID;
-  if (!isSnowflake(id)) return;
-  const ch = await client.channels.fetch(id);
+  // Which channel each topic goes to: its own (GUIDE_CHANNELS=key:id,...) or the shared GUIDE_CHANNEL_ID.
+  const own = Object.fromEntries(
+    String(process.env.GUIDE_CHANNELS || '').split(',').map((x) => x.trim().split(':').map((y) => y.trim())).filter(([k, v]) => k && isSnowflake(v))
+  );
+  // GUIDE_CHANNEL_ID can list several channels (comma-separated), e.g. a Forum for browsing plus a locked text
+  // channel for a Discord Onboarding resource page. Each gets the full guide.
+  const shared = String(process.env.GUIDE_CHANNEL_ID || '').split(',').map((x) => x.trim()).filter(isSnowflake);
+  const byChannel = new Map();
+  for (const item of DISCORD_GUIDE) {
+    for (const target of own[item.key] ? [own[item.key]] : shared) byChannel.set(target, [...(byChannel.get(target) || []), item]);
+  }
+  // GUIDE_RESOURCES=true: one read-only text channel per topic under a "Resources" category (each can be a
+  // Discord Onboarding resource page). Channels are found by name, so rename them in guide.js, not in Discord.
+  if (/^(1|true|yes|on)$/i.test(String(process.env.GUIDE_RESOURCES || '').trim())) {
+    try {
+      for (const [id, item] of await ensureResourceChannels()) byChannel.set(id, [...(byChannel.get(id) || []), item]);
+    } catch (err) {
+      log(`Couldn't set up resource channels: ${err.message}`);
+    }
+  }
+  for (const [id, items] of byChannel) {
+    try {
+      await syncGuideChannel(await client.channels.fetch(id), items);
+    } catch (err) {
+      log(`Couldn't update guide channel ${id}: ${err.message}`);
+    }
+  }
+}
+
+async function ensureResourceChannels() {
+  const guild = await client.guilds.fetch(DISCORD_GUILD_ID);
+  await guild.channels.fetch();
+  const catName = process.env.GUIDE_CATEGORY || 'Resources';
+  let cat = guild.channels.cache.find((c) => c.type === ChannelType.GuildCategory && c.name.toLowerCase() === catName.toLowerCase());
+  if (!cat) {
+    cat = await guild.channels.create({ name: catName, type: ChannelType.GuildCategory });
+    log(`Created category ${catName}`);
+  }
+  const R = OverwriteType.Role, U = OverwriteType.Member;
+  // Everyone can read; only the bot (and admins) can post, which is what Discord needs for resource pages.
+  const perms = [
+    { id: guild.roles.everyone.id, type: R, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.ReadMessageHistory], deny: [PermissionFlagsBits.SendMessages, PermissionFlagsBits.SendMessagesInThreads, PermissionFlagsBits.CreatePublicThreads, PermissionFlagsBits.CreatePrivateThreads, PermissionFlagsBits.AddReactions] },
+    { id: client.user.id, type: U, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.EmbedLinks, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageMessages] },
+  ];
+  const out = [];
+  let position = 0;
+  for (const item of DISCORD_GUIDE) {
+    if (!item.channel) continue;
+    let ch = guild.channels.cache.find((c) => c.parentId === cat.id && c.type === ChannelType.GuildText && c.name === item.channel);
+    if (!ch) {
+      ch = await guild.channels.create({ name: item.channel, type: ChannelType.GuildText, parent: cat.id, topic: (item.about || item.title).slice(0, 1024), permissionOverwrites: perms, position });
+      log(`Created resource channel #${item.channel}`);
+    } else if (item.about && ch.topic !== item.about) {
+      await ch.setTopic(item.about.slice(0, 1024)).catch(() => {});
+    }
+    out.push([ch.id, item]);
+    position++;
+  }
+  return out;
+}
+
+async function syncGuideChannel(ch, items) {
   let made = 0, edited = 0;
   if (ch.type === ChannelType.GuildForum) {
     const active = await ch.threads.fetchActive().catch(() => null);
     const archived = await ch.threads.fetchArchived({ limit: 100 }).catch(() => null);
     const mine = [...(active?.threads.values() || []), ...(archived?.threads.values() || [])].filter((t) => t.parentId === ch.id && t.ownerId === client.user.id);
     // Create in reverse so the first topic ends up at the top of a "newest first" forum.
-    for (const item of [...DISCORD_GUIDE].reverse()) {
+    for (const item of [...items].reverse()) {
       const embed = guideEmbed(item);
       let thread = mine.find((t) => t.name === item.title.slice(0, 100));
       if (!thread) {
@@ -4171,9 +4230,10 @@ async function syncDiscordGuide() {
       if (item.pin && !thread.flags?.has?.('Pinned')) await thread.pin().catch(() => {});
     }
   } else if (ch.isTextBased()) {
+    // Text channel (what Discord Onboarding resource pages need): one message per topic, top to bottom.
     const recent = await ch.messages.fetch({ limit: 100 });
     const mine = [...recent.values()].filter((m) => m.author.id === client.user.id && m.embeds[0]?.title);
-    for (const item of DISCORD_GUIDE) {
+    for (const item of items) {
       const embed = guideEmbed(item);
       const msg = mine.find((m) => m.embeds[0].title === embed.data.title);
       if (!msg) {
@@ -4185,7 +4245,7 @@ async function syncDiscordGuide() {
       }
     }
   }
-  log(`Discord guide in #${ch.name}: ${made} new, ${edited} updated, ${DISCORD_GUIDE.length - made - edited} unchanged`);
+  log(`Discord guide in #${ch.name}: ${made} new, ${edited} updated, ${items.length - made - edited} unchanged`);
 }
 
 client.once('clientReady', async () => {
