@@ -22,9 +22,10 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ThreadAutoArchiveDuration,
+  OverwriteType,
 } from 'discord.js';
 import { createServer } from 'node:http';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
 import { guideHtml } from './guide.js';
 import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS } from './schema.js';
@@ -78,6 +79,9 @@ function modeOf(fields) {
   if (fields[C.f.inviteOnlyBox]) return 'invite';
   return fields[C.f.requiresApproval] ? 'review' : 'open';
 }
+// Campaigns where the org picks creators: invite-only always; any other campaign when "Suggest Creators" is checked.
+const wantsPicks = (fields) => modeOf(fields) === 'invite' || !!fields[C.f.suggestOptIn];
+const PICKS_FORMULA = () => `OR({${C.names.joinMode}}="Invite-only", {${C.names.suggestOptIn}})`;
 
 function campaignInfo(rec) {
   return {
@@ -143,7 +147,7 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
     { name: '💰 Pay', value: pay ? `${money(pay)}` : 'Unpaid / TBD', inline: true },
     {
       name: '👥 Spots',
-      value: needed ? `${signups} of ${needed} filled\n${progressBar(signups, needed)}` : `${signups} signed up`,
+      value: (needed ? `${signups} of ${needed} filled\n${progressBar(signups, needed)}` : `${signups} signed up`) + '\n*Includes creators who joined on the web, so it can be higher than the ✅ count.*',
       inline: true,
     },
     { name: '📅 Dates', value: start && end ? `${start} –\n${end}` : start || end || 'Flexible', inline: true }
@@ -532,16 +536,19 @@ async function syncOrgLobby(guild, org, ch, camps) {
     const active = p.fields[C.f.status] === C.ACTIVE;
     for (const id of await committedDiscordIds(p.fields)) creatorActive.set(id, creatorActive.get(id) || active);
   }
+  // Every overwrite says whether it's a role or a person. Without that, discord.js has to look the ID up in its
+  // cache and fails ("not a cached User or Role") for anyone it hasn't seen since the bot started.
+  const R = OverwriteType.Role, U = OverwriteType.Member;
   const desired = [
-    { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-    { id: client.user.id, allow: BOT_PERMS },
+    { id: guild.roles.everyone.id, type: R, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: client.user.id, type: U, allow: BOT_PERMS },
   ];
   // Manage Threads lets staff see every private thread without being added to each one.
-  if (STAFF_ROLE_ID) desired.push({ id: STAFF_ROLE_ID, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageThreads] });
-  for (const id of orgIds) desired.push({ id, allow: [...VIEW, ...POST] });
+  if (STAFF_ROLE_ID) desired.push({ id: STAFF_ROLE_ID, type: R, allow: [...VIEW, ...POST, PermissionFlagsBits.ManageThreads] });
+  for (const id of orgIds) desired.push({ id, type: U, allow: [...VIEW, ...POST] });
   for (const [id, active] of creatorActive) {
     if (orgIds.has(id)) continue;
-    desired.push(active ? { id, allow: [...VIEW, ...POST] } : { id, allow: VIEW, deny: POST });
+    desired.push(active ? { id, type: U, allow: [...VIEW, ...POST] } : { id, type: U, allow: VIEW, deny: POST });
   }
   await ch.permissionOverwrites.set(desired);
   return orgIds;
@@ -699,13 +706,13 @@ async function doSyncCampaignThread(rec) {
     const old = await guild.channels.fetch(oldId).catch(() => null);
     if (old) {
       await old.send(`➡️ This campaign has moved to a thread in ${ch}: <#${thread.id}>. This channel is now read-only and kept for history.`).catch(() => {});
-      const keep = old.permissionOverwrites.cache.filter((o) => o.type === 1 && o.id !== client.user.id).map((o) => ({ id: o.id, allow: VIEW, deny: POST }));
+      const keep = old.permissionOverwrites.cache.filter((o) => o.type === 1 && o.id !== client.user.id).map((o) => ({ id: o.id, type: OverwriteType.Member, allow: VIEW, deny: POST }));
       const archive = await ensureCategory(guild, ARCHIVE_CATEGORY);
       await old.setParent(archive.id, { lockPermissions: false }).catch(() => {});
       await old.permissionOverwrites.set([
         { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
         { id: client.user.id, allow: BOT_PERMS },
-        ...(STAFF_ROLE_ID ? [{ id: STAFF_ROLE_ID, allow: VIEW }] : []),
+        ...(STAFF_ROLE_ID ? [{ id: STAFF_ROLE_ID, type: OverwriteType.Role, allow: VIEW }] : []),
         ...keep,
       ]).catch(() => {});
       log(`Moved old channel #${old.name} → thread ${thread.id}`);
@@ -1326,6 +1333,8 @@ async function staffNote(content) {
 // Creates an "Invited" row for each creator in Invited Creators who doesn't have one yet, and DMs them.
 async function sendInvites(rec) {
   const f = rec.fields;
+  // Open / Partner-reviewed campaigns with Suggest Creators: wait for the public post, and use its ID.
+  if (modeOf(f) !== 'invite' && (!f[C.f.discordMessageId] || isInviteKey(f[C.f.discordMessageId]))) return;
   const key = f[C.f.discordMessageId] || inviteKey(rec.id);
   if (!f[C.f.discordMessageId]) {
     await at.update(C.table, rec.id, { [C.f.discordMessageId]: key, [C.f.discordClosed]: false });
@@ -1466,16 +1475,16 @@ async function handleInviteCommand(interaction) {
     return interaction.editReply("This command is for partner organizations. Run `/link` with your organization's application email first.");
   }
   let campaigns;
-  const fields = [C.f.shortName, C.f.status, C.f.joinMode, C.f.suggested, C.f.invited, C.f.suggestionNotes, C.f.postToDiscord];
+  const fields = [C.f.shortName, C.f.status, C.f.joinMode, C.f.suggested, C.f.invited, C.f.suggestionNotes, C.f.postToDiscord, C.f.suggestOptIn, C.f.inviteOnlyBox, C.f.requiresApproval];
   if (staff) {
-    campaigns = await at.list(C.table, { formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.joinMode}}="Invite-only")`, fields });
+    campaigns = await at.list(C.table, { formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, ${PICKS_FORMULA()})`, fields });
   } else {
     const ids = [...new Set(orgs.flatMap((o) => o.fields[O.f.proposals] || []))];
     campaigns = (ids.length ? await listByIds(C.table, ids, fields) : []).filter(
-      (p) => p.fields[C.f.status] === C.ACTIVE && p.fields[C.f.joinMode] === 'Invite-only'
+      (p) => p.fields[C.f.status] === C.ACTIVE && wantsPicks(p.fields)
     );
   }
-  if (!campaigns.length) return interaction.editReply('You don’t have any active invite-only campaigns. Ask the Creator Congress team to set one up.');
+  if (!campaigns.length) return interaction.editReply('None of your active campaigns take invitations. Invite-only campaigns do, and so does any campaign with **Suggest Creators** turned on. Ask the Creator Congress team to turn it on.');
 
   // Picked a specific creator from the search box
   const chosen = interaction.options.getString('creator');
@@ -1487,7 +1496,7 @@ async function handleInviteCommand(interaction) {
     const { embed } = buildReviewCard({ req: { id: c.id, fields: { [K.f.discordUsername]: nm } }, camp: campaigns[0], creator: c }, { banner: '🔎  CREATOR YOU PICKED' });
     embed.setTitle(nm.slice(0, 256)).setColor(0x9b59b6).setFooter({ text: 'Choose which campaign to invite them to.' });
     const open = campaigns.filter((p) => !(p.fields[C.f.invited] || []).includes(c.id));
-    if (!open.length) return interaction.editReply({ content: `**${nm}** is already invited to all of your invite-only campaigns.`, embeds: [embed] });
+    if (!open.length) return interaction.editReply({ content: `**${nm}** is already invited to all of your campaigns that take invitations.`, embeds: [embed] });
     const rows = [];
     for (let i = 0; i < open.slice(0, 20).length; i += 4) {
       rows.push(
@@ -1584,13 +1593,13 @@ async function syncInviteCampaigns() {
   const fields = Object.values(C.f);
   // Suggestions: new invite-only campaigns, or Refresh Suggestions checked.
   const needSuggest = await at.list(C.table, {
-    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.joinMode}}="Invite-only", OR({${C.names.suggestionNotes}}="", {${C.names.refreshSuggestions}}))`,
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, ${PICKS_FORMULA()}, OR({${C.names.suggestionNotes}}="", {${C.names.refreshSuggestions}}))`,
     fields,
   });
   for (const rec of needSuggest) await computeSuggestions(rec);
   // Invitations: live invite-only campaigns with anyone new in Invited Creators.
   const live = await at.list(C.table, {
-    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.joinMode}}="Invite-only", {${C.names.postToDiscord}})`,
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, ${PICKS_FORMULA()}, {${C.names.postToDiscord}})`,
     fields,
   });
   for (const rec of live) await sendInvites(rec);
@@ -1992,6 +2001,7 @@ const brandHtml = (label) =>
   `<div class="brand">${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Creator Congress" onerror="this.remove()">` : ''}<span>Creator Congress${label ? ` · ${esc(label)}` : ''}</span></div>`;
 
 const PAGE_CSS = `
+.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
 :root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
 @media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
 body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
@@ -2086,6 +2096,13 @@ function campaignCard(p, { mineRow, inviteRow, token, posts = [] }) {
 }
 
 const FLASH = {
+  discordjoined: "🎉 You're in! Your Discord is linked and you've been added to the Creator Congress server. Check Discord for a welcome message.",
+  discordlinked: '✅ Your Discord is linked. You were already in the server, so you’re all set.',
+  discordcancel: 'No problem, nothing was changed. You can connect Discord any time.',
+  discordfail: 'Something went wrong connecting Discord. Please try again, or use /link in Discord.',
+  discordother: 'This profile is already linked to a different Discord account. Reply to any Creator Congress email and we’ll fix it.',
+  discordtaken: 'That Discord account is already linked to another profile. Reply to any Creator Congress email and we’ll fix it.',
+  discordoff: 'Discord sign-in isn’t set up yet. Use /link in the Creator Congress Discord instead.',
   joined: "🎉 You're in! Your contact and payment details are on the campaign card below.",
   requested: "🙋 Request sent! The partner reviews each sign-up and you'll get an email once you're confirmed.",
   left: "You've left the campaign. You can rejoin anytime while it's open.",
@@ -2140,6 +2157,7 @@ async function renderCreatorPage(creator, token, flash) {
   const body = `
 <header>${brandHtml()}<h1>Hi ${esc(firstName)} 👋</h1><p>Your campaigns, invitations and expected pay, all in one place.</p></header>
 ${flash && FLASH[flash] ? `<div class="flash">${esc(FLASH[flash])}</div>` : ''}
+${discordButtonHtml('c', token, isSnowflake(cf[M.f.discordUserId]))}
 <div class="stats">
   <div class="stat"><b>${esc(money(expected) || '$0')}</b>expected pay</div>
   <div class="stat"><b>${esc(money(paidSoFar) || '$0')}</b>paid so far</div>
@@ -2164,6 +2182,150 @@ async function creatorByToken(token) {
   });
 }
 
+// ---------- "Join on Discord" (Discord OAuth: link the account + add them to the server in one click) ----------
+// Needs DISCORD_CLIENT_SECRET, and https://<PUBLIC_URL>/discord/callback added as a Redirect in the Discord
+// Developer Portal (OAuth2). Optional: CREATOR_ROLE_ID / PARTNER_ROLE_ID are given to people who join this way.
+const discordOauthReady = () => Boolean(process.env.DISCORD_CLIENT_SECRET && publicBase());
+const oauthRedirect = () => `${publicBase()}/discord/callback`;
+const signState = (payload) => {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = createHmac('sha256', process.env.DISCORD_CLIENT_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+};
+function readState(state) {
+  const [body, sig] = String(state || '').split('.');
+  if (!body || !sig) return null;
+  const want = createHmac('sha256', process.env.DISCORD_CLIENT_SECRET).update(body).digest('base64url');
+  const a = Buffer.from(sig), b = Buffer.from(want);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString());
+    return Date.now() - p.t < 20 * 60_000 ? p : null; // links are good for 20 minutes
+  } catch {
+    return null;
+  }
+}
+
+function discordStart(res, kind, token) {
+  if (!discordOauthReady()) {
+    res.writeHead(303, { Location: `/${kind}/${token}?done=discordoff`, 'Cache-Control': 'no-store' });
+    return res.end();
+  }
+  const q = new URLSearchParams({
+    client_id: DISCORD_CLIENT_ID,
+    response_type: 'code',
+    redirect_uri: oauthRedirect(),
+    scope: 'identify guilds.join',
+    state: signState({ k: kind, t: Date.now(), tok: token }),
+    prompt: 'consent',
+  });
+  res.writeHead(302, { Location: `https://discord.com/oauth2/authorize?${q}`, 'Cache-Control': 'no-store' });
+  return res.end();
+}
+
+async function discordCallback(res, url) {
+  const st = discordOauthReady() ? readState(url.searchParams.get('state')) : null;
+  const back = (done) => {
+    res.writeHead(303, { Location: st ? `/${st.k}/${st.tok}?done=${done}` : '/guide', 'Cache-Control': 'no-store' });
+    return res.end();
+  };
+  if (!st) return back('discordfail');
+  if (url.searchParams.get('error')) return back('discordcancel'); // they clicked Cancel on Discord's screen
+  try {
+    // 1) Swap the code for a short-lived token, and find out who they are.
+    const tokRes = await fetch('https://discord.com/api/v10/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: DISCORD_CLIENT_ID,
+        client_secret: process.env.DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code: url.searchParams.get('code') || '',
+        redirect_uri: oauthRedirect(),
+      }),
+    });
+    const tok = await tokRes.json();
+    if (!tok.access_token) {
+      log('Discord sign-in: token exchange failed', tok.error || tokRes.status, tok.error_description || '');
+      return back('discordfail');
+    }
+    const me = await (await fetch('https://discord.com/api/v10/users/@me', { headers: { Authorization: `Bearer ${tok.access_token}` } })).json();
+    if (!isSnowflake(me.id)) return back('discordfail');
+
+    // 2) Link them in Airtable (same rules as /link).
+    let result;
+    if (st.k === 'c') {
+      const creator = await creatorByToken(st.tok);
+      if (!creator || !creator.fields[M.f.approved]) return back('discordfail');
+      result = await linkCreatorDiscord(creator, me.id);
+    } else {
+      const org = await orgByToken(st.tok);
+      if (!org || !org.fields[O.f.approved]) return back('discordfail');
+      result = await linkOrgDiscord(org, me.id);
+    }
+    if (result !== 'ok') return back(result);
+
+    // 3) Add them to the server (or just give the role if they're already in).
+    const role = st.k === 'c' ? process.env.CREATOR_ROLE_ID : process.env.PARTNER_ROLE_ID;
+    const put = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${me.id}`, {
+      method: 'PUT',
+      headers: { Authorization: `Bot ${DISCORD_TOKEN.trim()}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ access_token: tok.access_token, ...(isSnowflake(role) ? { roles: [role] } : {}) }),
+    });
+    const joinedNow = put.status === 201;
+    if (put.status !== 201 && put.status !== 204) log(`Discord sign-in: couldn't add ${me.id} to the server (${put.status}) ${await put.text().catch(() => '')}`);
+    if (!joinedNow && isSnowflake(role)) {
+      const guild = await client.guilds.fetch(DISCORD_GUILD_ID).catch(() => null);
+      const member = guild ? await guild.members.fetch(me.id).catch(() => null) : null;
+      if (member && !member.roles.cache.has(role)) await member.roles.add(role).catch((err) => log(`Couldn't give role to ${me.id}: ${err.message}`));
+    }
+    log(`Discord sign-in: ${st.k === 'c' ? 'creator' : 'org contact'} ${me.id} linked${joinedNow ? ' and added to the server' : ''}`);
+
+    // 4) Welcome DM (best effort; their private threads are filled in on the next sweep, within ~2 minutes).
+    const user = await client.users.fetch(me.id).catch(() => null);
+    await user?.send(
+      st.k === 'c'
+        ? `👋 Welcome to Creator Congress! Your account is linked.\n\n• Browse campaigns in <#${CAMPAIGN_CHANNEL_ID}> and react ${SIGNUP_EMOJI} to join.\n• \`/mycampaigns\` shows everything you're on.\n• You'll be added to the private thread for each campaign you're confirmed on.`
+        : `👋 Welcome to Creator Congress! You're linked to your organization. You'll be added to your organization's private channel and campaign threads in a minute or two. Try \`/roster\` and \`/review\`.`
+    ).catch(() => {});
+    return back(joinedNow ? 'discordjoined' : 'discordlinked');
+  } catch (err) {
+    log('Discord sign-in error', err);
+    return back('discordfail');
+  }
+}
+
+async function linkCreatorDiscord(creator, discordId) {
+  const existing = creator.fields[M.f.discordUserId];
+  if (existing && existing !== discordId) return 'discordother';
+  const already = await findMemberByDiscordId(discordId);
+  if (already && already.id !== creator.id) return 'discordtaken';
+  if (existing !== discordId) await at.update(M.table, creator.id, { [M.f.discordUserId]: discordId });
+  const orphans = await at.list(K.table, {
+    formula: `AND({${K.names.discordUserId}}=${at.q(discordId)}, {${K.names.creator}}="")`,
+    fields: [K.f.title],
+  });
+  for (const o of orphans) await at.update(K.table, o.id, { [K.f.creator]: [creator.id] });
+  await deliverSavedInvites(creator.id, discordId).catch(() => 0);
+  return 'ok';
+}
+
+async function linkOrgDiscord(org, discordId) {
+  const ids = idList(org.fields[O.f.discordUserId]);
+  if (!ids.includes(discordId)) await at.update(O.table, org.id, { [O.f.discordUserId]: [...ids, discordId].join(',') });
+  return 'ok';
+}
+
+// The button on both pages. Linked already → a quiet "Open Discord" link instead.
+function discordButtonHtml(kind, token, linked) {
+  if (linked) return `<p class="muted discordline">💬 Your Discord is connected. <a href="https://discord.com/channels/${DISCORD_GUILD_ID}">Open Creator Congress on Discord</a></p>`;
+  if (!discordOauthReady()) return '';
+  return `<div class="card discordcta"><div><b>Join us on Discord</b><p class="muted">${kind === 'c'
+    ? 'One click links your account, adds you to the Creator Congress server and your campaign threads. Optional: everything also works from this page.'
+    : 'One click links your account and adds you to your organization’s private channel and campaign threads. Optional: everything also works from this page.'}</p></div>
+<a class="btn-discord" href="/${kind}/${token}/discord">Join on Discord</a></div>`;
+}
+
 function startWebServer() {
   const port = Number(process.env.PORT) || 3000;
   const send = (res, code, html, headers = {}) => {
@@ -2177,6 +2339,10 @@ function startWebServer() {
     try {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
+      // "Join on Discord" from a creator or partner page (Discord sign-in → linked + added to the server)
+      const dj = url.pathname.match(/^\/(c|o)\/([a-f0-9]{32})\/discord\/?$/);
+      if (dj && req.method === 'GET') return discordStart(res, dj[1], dj[2]);
+      if (url.pathname === '/discord/callback') return discordCallback(res, url);
       // Public how-to guide (shareable): the site root and /guide
       if (url.pathname === '/' || /^\/guide\/?$/.test(url.pathname)) {
         return send(res, 200, guideHtml({ css: PAGE_CSS, brand: brandHtml(), discordInvite: process.env.DISCORD_INVITE_URL || '' }));
@@ -2881,11 +3047,18 @@ async function orgByToken(token) {
   if (!/^[a-f0-9]{32}$/.test(token)) return null;
   return at.first(O.table, {
     formula: `{${O.names.pageToken}}=${at.q(token)}`,
-    fields: [O.f.organization, O.f.firstName, O.f.proposals, O.f.approved],
+    fields: [O.f.organization, O.f.firstName, O.f.proposals, O.f.approved, O.f.discordUserId],
   });
 }
 
 const ORG_FLASH = {
+  discordjoined: "🎉 You're in! Your Discord is linked and you've been added to the Creator Congress server and your organization’s private channel.",
+  discordlinked: '✅ Your Discord is linked. You were already in the server, so you’re all set.',
+  discordcancel: 'No problem, nothing was changed. You can connect Discord any time.',
+  discordfail: 'Something went wrong connecting Discord. Please try again, or use /link in Discord.',
+  discordother: 'This profile is already linked to a different Discord account. Reply to any Creator Congress email and we’ll fix it.',
+  discordtaken: 'That Discord account is already linked to another profile. Reply to any Creator Congress email and we’ll fix it.',
+  discordoff: 'Discord sign-in isn’t set up yet. Use /link in the Creator Congress Discord instead.',
   approved: '✅ Approved. The creator has been told and added to the campaign.',
   postapproved: '✅ Post approved. The creator has been told.',
   postchanges: '✏️ Sent. The creator has been asked to submit an updated post.',
@@ -2932,7 +3105,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
   // Requests waiting for review + suggestions for invite-only campaigns
   const allRows = rowIds.length ? await listByIds(K.table, rowIds, [K.f.status, K.f.campaign, K.f.creator, K.f.requestedAt, K.f.discordUsername]) : [];
   const pending = allRows.filter((r) => r.fields[K.f.status] === 'Pending');
-  const inviteCamps = props.filter((p) => p.fields[C.f.status] === C.ACTIVE && modeOf(p.fields) === 'invite');
+  const inviteCamps = props.filter((p) => p.fields[C.f.status] === C.ACTIVE && wantsPicks(p.fields));
   const profileIds = new Set(pending.map((r) => first1(r.fields[K.f.creator])).filter(Boolean));
   for (const p of inviteCamps) for (const id of [...(p.fields[C.f.suggested] || []), ...(p.fields[C.f.invited] || [])]) profileIds.add(id);
   const profiles = new Map(
@@ -2977,7 +3150,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
     const results = searching ? searchCreators(dir, crit) : [];
     const invitedTo = (cid) => inviteCamps.filter((p) => (p.fields[C.f.invited] || []).includes(cid));
     findHtml = `<h2 id="find">🔎 Find creators</h2>
-  <p class="muted">Search the whole Creator Congress network and invite anyone to your invite-only campaigns. Contact info is shared only after a creator accepts.</p>
+  <p class="muted">Search the whole Creator Congress network and invite anyone to your invite-only campaigns, or to any campaign with suggested creators turned on. Contact info is shared only after a creator accepts.</p>
   <form method="get" action="/o/${token}#find" class="card findform">
     <input name="q" placeholder="Name or handle" value="${esc(crit.q)}">
     <select name="issue"><option value="">Any issue</option>${issuesAll.map((v) => opt(v, crit.issue)).join('')}</select>
@@ -3062,6 +3235,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
 <header>${brandHtml('Partner page')}<h1>${esc(org.fields[O.f.organization] || 'Your organization')}</h1>
 <p>Review requests, invite creators, see who's confirmed, and track payments.</p></header>
 ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>` : ''}
+${discordButtonHtml('o', token, idList(org.fields[O.f.discordUserId]).some(isSnowflake))}
 <div class="stats">
   <div class="stat"><b>${cnt('Paid')}</b>paid${tot('Paid') ? ` · ${esc(money(tot('Paid')))}` : ''}</div>
   <div class="stat"><b>${cnt('Org says paid')}</b>waiting on creator</div>
@@ -3522,7 +3696,7 @@ const commands = [
   new SlashCommandBuilder().setName('review').setDescription('For organizations: approve or decline creators who asked to join your campaigns'),
   new SlashCommandBuilder()
     .setName('invite')
-    .setDescription('For organizations: invite creators to your invite-only campaigns (suggestions, or search by name)')
+    .setDescription('For organizations: invite suggested creators, or search by name')
     .addStringOption((o) => o.setName('creator').setDescription('Search any approved creator by name or handle').setAutocomplete(true).setRequired(false)),
   new SlashCommandBuilder()
     .setName('submit')
