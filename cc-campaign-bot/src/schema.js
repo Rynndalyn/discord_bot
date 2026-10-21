@@ -42,11 +42,17 @@ export const CAMPAIGNS = {
     orgEmail: 'fldEJo13p4tt7uCjd', // lookup: org application Email
     paymentDetails: 'fldVlbz2T64q54LJj', // Payment Details (rich text / markdown)
     commitments: 'fldANy5riz4mePn4U', // inverse link to Campaign Commitments
+    repost: 'fldDdIVjWyXcAydrR', // Repost to Discord (checkbox, unchecks itself)
+    postsRequired: 'fld8ipVrIIOQRV43P', // number of posts each creator must submit
+    postsDueBy: 'fldQ6Svg1PiyAhWMX',
+    reviewPosts: 'fldhh72AAzqK7jQ1v', // org approves each post before it counts
+    posts: 'fldivsCtv729Vq0Pe', // inverse link to Campaign Posts
   },
   names: {
     status: 'Active / Inactive',
     longTerm: 'Long-term (Discord channel)',
     orgLinks: 'Organization Applications',
+    repost: 'Repost to Discord',
     oldChannelId: 'Old Discord Channel ID',
     threadId: 'Discord Thread ID',
     requiresApproval: 'Requires approval',
@@ -153,7 +159,13 @@ export const COMMITMENTS = {
     paidConfirmedBy: 'fldm5FJYmv40YWOct', // Creator / Auto (14 days) / Staff
     paymentReminders: 'fldiZyTYZceF3Fm9X',
     paymentFlagged: 'fldmMndetPEcaWf2U',
-    paymentDueDate: 'fldFrtYERMKtPySiN', // formula: End Date + 30 days
+    paymentDueDate: 'fldFrtYERMKtPySiN', // formula: posts complete (or End Date) + 30 days
+    postsAccepted: 'fldEWxw09yosMLcfz',
+    postsCompletedAt: 'fldXUR1ri505UOQo5',
+    postReminders: 'fld74HmjRvJfrQM9b',
+    postsRequired: 'fldE5QvBiLSgtOIVt', // lookup
+    postsDueBy: 'fldIE6Idgh37O6Sjo', // lookup
+    posts: 'fldwzqFm8V165fU3L', // inverse link to Campaign Posts
   },
   names: {
     status: 'Status',
@@ -195,4 +207,44 @@ export const PORTAL = {
     creator: 'fldhu6t4gvKMHjNso',
   },
   names: { status: 'Status', action: 'Action' },
+};
+
+export const POSTS = {
+  table: 'tblDcJb2oL5rIVzfj', // Campaign Posts (one row per submitted post)
+  f: {
+    title: 'fldJzSusBrwYoCp7Q',
+    link: 'fldTEicEemrWs2DcT',
+    platform: 'fldyGkIO6VUxKX86J',
+    status: 'fld2tGr1ynw7ihIyS', // Submitted / Approved / Needs changes
+    submittedAt: 'fldHQeKty7Fziu7U8',
+    via: 'fld6nzisWQgg5TZCz',
+    note: 'fldyA8aIYwRyYDlzD',
+    reviewedBy: 'fldCNBypi1zNH1uqA',
+    reviewedAt: 'fld1PEMDhDkN18VZW',
+    screenshot: 'fldTYkcI4xfk7eaRE',
+    commitment: 'fldCvu5Hi76abtPir',
+    campaign: 'fldt5WMGX6XICqZHG',
+    creator: 'fldtVoHKNr2ctrTRU',
+    analysis: 'fldHthQGilpi27ISY',
+    notified: 'fldD1yZ9l8bAvx7qS',
+    insights: 'fldnPPT7MZ2iYfdR3', // AI text: "views=..; likes=..; comments=..; shares=.."
+    metricsCopied: 'fldJ5ff40CkfxdE46',
+    totalViews: 'flda3lZnsp9HyuhFb', // lookup
+  },
+  names: { status: 'Status', notified: 'Reviewer Notified', metricsCopied: 'Metrics Copied', insights: 'Insights (AI)' },
+};
+
+// Existing Creator Post Analysis table (performance numbers per post)
+export const ANALYSIS = {
+  table: 'tblaqf3uu3DOUakuA',
+  f: {
+    name: 'fldRS3fz3KhNlHkC8',
+    notes: 'fldxXmwLFWnHkbLdy',
+    platforms: 'fldKjhAPLcX1ClJ0i', // IG / TikTok / Threads / Youtube / Substack / X
+    organization: 'fld4JM4tIbnVGFt42',
+    payment: 'fld7bfnamE4Hr9IPv',
+    ig: { link: 'fldjVfOCfP5k01vQk', views: 'fldO6alLwOTTpWb31', likes: 'fldJbLHDkrIjPtDxD', comments: 'fldiGd4LnEDAWHKzI', shares: 'fldftlba1FjcaxaG3' },
+    tiktok: { link: 'fldjoFgOZiqfHl0w2', views: 'fldJ8sDaiZgiAXsrB', likes: 'fldLIUJG9EErbkbbA', comments: 'fldHGSnBZO6cYjlDw', shares: 'fldDJFkg7AS1HlWYC' },
+    other: { link: 'fldeWQXBvjrEJEqWa', views: 'fld9FqCHiaOJlvRbQ', likes: 'fldIAeeiugd0boz3S', comments: 'fld7QgRGMLdsRPxtw', shares: 'fldqpp5DgW8njLU3C' },
+  },
 };
