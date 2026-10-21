@@ -60,7 +60,7 @@ ${brand}
 <h2 id="c-posts">4. Submit your posts</h2>
 <p>If a campaign asks for posts, log each one as soon as it's live.</p>
 <ol class="steps">
-  <li>In Discord, type <code>/submit</code>, paste your post link, pick the campaign, and attach a screenshot of the post's insights (views, likes, comments, shares) if you can. You can also submit from your campaigns page.</li>
+  <li>In Discord, type <code>/submit</code>, paste your post link, pick the campaign, and attach a screenshot of the post's insights (views, likes, comments, shares) if you can. You can also submit from your campaigns page, or just email the link (and a screenshot) to <a href="mailto:hello@creatorcongress.net">hello@creatorcongress.net</a> from the email you applied with. If you're on more than one campaign, put the campaign name in the subject. We'll reply to confirm.</li>
   <li>Some orgs review posts before they count. If they ask for changes, you'll get a DM with their note. Fix the post and submit it again.</li>
   <li>Track your progress (for example <i>2 of 3 posts</i>) in <code>/mycampaigns</code> or on your campaigns page.</li>
 </ol>
@@ -236,7 +236,7 @@ Then head to {campaigns} to find your first campaign. The other posts here walk 
 **2.** Attach a screenshot of the post's insights (views, likes, comments, shares) if you can. We read the numbers automatically.
 **3.** Some orgs review posts before they count. If they ask for changes, you'll get a DM with their note. Fix it and submit again.
 
-You can also submit from your campaigns page. Check your progress (like *2 of 3 posts*) in \`/mycampaigns\`.
+You can also submit from your campaigns page, or email the link (and a screenshot) to hello@creatorcongress.net from the email you applied with. On more than one campaign? Put the campaign name in the subject. Check your progress (like *2 of 3 posts*) in \`/mycampaigns\`.
 
 📄 {guide}#c-posts`,
   },
