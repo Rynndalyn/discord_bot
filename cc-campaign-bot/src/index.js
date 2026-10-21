@@ -743,6 +743,29 @@ async function sweepCampaignThreads() {
 
 // ---------- members & commitments ----------
 
+// Sign-ups made on the web before (or without) linking Discord have no Discord ID on the row, so Discord features
+// (/mycampaigns, /submit, private threads) can't see them. Copy the creator's Discord ID onto those rows.
+async function backfillCommitmentDiscordIds() {
+  const rows = await at.list(K.table, {
+    formula: `AND({${K.names.discordUserId}}="", {${K.names.creator}}!="", OR({${K.names.status}}="Committed", {${K.names.status}}="Pending", {${K.names.status}}="Invited"))`,
+    fields: [K.f.creator],
+    maxRecords: 100,
+  });
+  if (!rows.length) return 0;
+  const ids = [...new Set(rows.map((r) => first1(r.fields[K.f.creator])).filter(Boolean))];
+  const members = new Map((await listByIds(M.table, ids, [M.f.discordUserId])).map((m) => [m.id, m.fields[M.f.discordUserId]]));
+  let n = 0;
+  for (const r of rows) {
+    const did = members.get(first1(r.fields[K.f.creator]));
+    if (!isSnowflake(did)) continue;
+    await at.update(K.table, r.id, { [K.f.discordUserId]: did });
+    n++;
+  }
+  if (n) log(`Linked ${n} web sign-up(s) to their creators' Discord accounts`);
+  return n;
+}
+
+
 async function findMemberByDiscordId(userId) {
   if (!isSnowflake(userId)) return null;
   return at.first(M.table, {
@@ -1875,7 +1898,9 @@ async function maybeSendWeeklyDigest() {
   if (recent) return;
   const open = (await listOpenCampaigns()).filter((p) => !isFull(p.fields));
   if (!open.length) return;
-  const creators = await at.list(M.table, { formula: `AND({${M.names.approved}}, {Email}!="")`, fields: CREATOR_CONTACT_FIELDS() });
+  // Only creators with a reach on file: records with no follower count are usually partner staff or incomplete profiles.
+  const creators = (await at.list(M.table, { formula: `AND({${M.names.approved}}, {Email}!="")`, fields: [...CREATOR_CONTACT_FIELDS(), M.f.reach] }))
+    .filter((c) => Number(c.fields[M.f.reach]) > 0);
   const list = open
     .slice(0, 12)
     .map((p) => {
@@ -2309,6 +2334,7 @@ async function linkCreatorDiscord(creator, discordId) {
     fields: [K.f.title],
   });
   for (const o of orphans) await at.update(K.table, o.id, { [K.f.creator]: [creator.id] });
+  await backfillCommitmentDiscordIds().catch(() => {});
   await deliverSavedInvites(creator.id, discordId).catch(() => 0);
   return 'ok';
 }
@@ -3803,6 +3829,7 @@ async function handleLink(interaction) {
     fields: [K.f.title],
   });
   for (const o of orphans) await at.update(K.table, o.id, { [K.f.creator]: [member.id] });
+  await backfillCommitmentDiscordIds().catch(() => {});
 
   const savedInvites = await deliverSavedInvites(member.id, interaction.user.id);
   const name = member.fields[M.f.firstName] ? `, ${member.fields[M.f.firstName]}` : '';
@@ -3816,6 +3843,7 @@ async function handleLink(interaction) {
 }
 
 async function handleMyCampaigns(interaction) {
+  await backfillCommitmentDiscordIds().catch(() => {});
   let rows = await at.list(K.table, {
     formula: `AND({${K.names.discordUserId}}=${at.q(interaction.user.id)}, OR({${K.names.status}}="Committed", {${K.names.status}}="Pending", {${K.names.status}}="Invited"))`,
     fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay, K.f.orgName, K.f.status, K.f.leadContact, K.f.paymentDetails, K.f.paymentStatus, K.f.amountPaid, K.f.paidConfirmedBy, K.f.paymentDueDate, K.f.postsRequired, K.f.postsAccepted, K.f.campaignEndDate],
@@ -4138,6 +4166,7 @@ async function poll() {
   polling = true;
   try {
     await syncCampaignPosts();
+    await backfillCommitmentDiscordIds();
     await normalizeJoinModes();
     await ensurePortalTokens();
     await syncInviteCampaigns();
