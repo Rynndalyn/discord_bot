@@ -31,7 +31,7 @@ ${brand}
 <h2 id="c-setup">1. Get set up</h2>
 <ol class="steps">
   <li><b>Get approved.</b> Apply to Creator Congress. Once you're approved, you'll get an email with your personal <b>campaigns page</b> link. Bookmark it.</li>
-  <li><b>Link your Discord.</b> In the Creator Congress Discord, type <code>/link</code> followed by the email you applied with. You only do this once.</li>
+  <li><b>Join the Discord (optional).</b> On your campaigns page, click <b>Join on Discord</b>. One click links your account and adds you to the server. Already in the server? Type <code>/link</code> followed by the email you applied with instead. Everything also works from your campaigns page, so Discord is optional.</li>
   <li><b>Turn on DMs.</b> The bot sends confirmations, invitations and payment check-ins by direct message. Right-click the server icon → <b>Privacy Settings</b> → turn on <b>Direct Messages</b>.</li>
 </ol>
 
@@ -39,7 +39,8 @@ ${brand}
 <p>Every open campaign has its own post in <b>#active-campaigns</b>. The list shows the topline; click a post for the full brief.</p>
 <ul>
   <li><b>Filter</b> with the tags at the top of the channel: 💰 Paid, 🤝 Unpaid, 🟢 Open, 🙋 Partner-reviewed, plus issue areas.</li>
-  <li><b>Join</b> by reacting ✅ on the campaign post.</li>
+  <li><b>Join</b> by reacting ✅ on the campaign post, or with the <b>Join</b> button on your campaigns page.</li>
+  <li><b>Spots</b> on each post counts everyone who's joined, including on the web, so it can be higher than the ✅ count.</li>
   <li><b>Ask questions</b> by replying inside that campaign's post. Keep it on topic and respectful.</li>
 </ul>
 <div class="grid3">
@@ -93,8 +94,8 @@ ${brand}
 <h2 id="p-setup">1. Get set up</h2>
 <ul>
   <li><b>Your partner page.</b> Once your organization is approved, you'll get an email with a private <b>partner page</b> link. You can do everything from it without using Discord: review requests, find and invite creators, review posts and mark creators paid. Treat the link like a password.</li>
-  <li><b>On Discord?</b> Type <code>/link</code> with the email from your organization's application. Your team gets a private channel under <b>Partner Organizations</b>, with a private thread for each campaign that includes only your confirmed creators and the Creator Congress team.</li>
-  <li><b>Submit a campaign</b> through the campaign proposal form. Choose how creators join (Open, Partner-reviewed or Invite-only), the pay, dates, number of posts and whether you want to review posts.</li>
+  <li><b>On Discord?</b> Click <b>Join on Discord</b> on your partner page, or type <code>/link</code> with the email from your organization's application. Your team gets a private channel under <b>Partner Organizations</b>, with a private thread for each campaign that includes only your confirmed creators and the Creator Congress team.</li>
+  <li><b>Submit a campaign</b> through the campaign proposal form. Choose how creators join (Open, Partner-reviewed or Invite-only), whether you want suggested creators, the pay, dates, number of posts and whether you want to review posts.</li>
 </ul>
 
 <h2 id="p-choose">2. Choose your creators</h2>
@@ -103,8 +104,9 @@ ${brand}
   <div class="card"><h3>🙋 Partner-reviewed</h3><p>Each request comes to you with the creator's profile. Approve or decline it by DM, with <code>/review</code> or on your partner page.</p></div>
   <div class="card"><h3>✉️ Invite-only</h3><p>Pick creators yourself from our suggestions, or search the whole network by name, issue, state and reach.</p></div>
 </div>
+<div class="card suggest"><h3>✨ Suggested creators (optional, any campaign)</h3><p>Check <b>Suggest Creators</b> on your proposal and we'll build a shortlist of creators who match your issues, location and reach, with a note on why each one fits. Invite the ones you want from your partner page or with <code>/invite</code>. It's always on for Invite-only campaigns, and you can add it to Open or Partner-reviewed campaigns to reach people who might not see the post. Want a fresh list later? Ask the Creator Congress team to refresh it.</p></div>
 <ul>
-  <li><b>Inviting creators:</b> use <b>Find creators</b> on your partner page, or <code>/invite</code> in Discord. You'll see profiles, issue areas and reach. Contact info is shared only after a creator accepts.</li>
+  <li><b>Inviting creators:</b> use <b>Find creators</b> on your partner page, or <code>/invite</code> in Discord. You'll see profiles, issue areas and reach. Invited creators get a DM or email with <b>Accept</b> / <b>No thanks</b>. Contact info is shared only after a creator accepts.</li>
   <li><b>See who's in:</b> <code>/roster</code> or your partner page lists everyone confirmed on each campaign.</li>
   <li><b>Don't wait:</b> requests pending 7+ days are flagged to the Creator Congress team.</li>
 </ul>
@@ -126,7 +128,7 @@ ${brand}
   <tr><td><code>/link</code></td><td>Connect your Discord to your organization (use your application email)</td></tr>
   <tr><td><code>/roster</code></td><td>Who's signed up for each of your campaigns</td></tr>
   <tr><td><code>/review</code></td><td>Approve or decline requests to join</td></tr>
-  <tr><td><code>/invite</code></td><td>Invite creators to your invite-only campaigns</td></tr>
+  <tr><td><code>/invite</code></td><td>Invite suggested creators, or search for anyone by name</td></tr>
   <tr><td><code>/payments</code></td><td>Payment status for your creators, and mark them paid</td></tr>
 </tbody></table>
 </section>
@@ -160,6 +162,7 @@ ul{padding-left:20px}ul li{margin:6px 0}
 table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
 td{padding:9px 12px;border-top:1px solid var(--line);vertical-align:top}tr:first-child td{border-top:0}td:first-child{white-space:nowrap;width:1%}
 code{background:var(--soft);color:var(--violet);padding:1px 6px;border-radius:6px;font-size:.92em}
+.suggest{margin:12px 0;border-color:var(--accent);background:var(--soft)}.suggest p{color:var(--ink)}
 .muted{color:var(--muted)}.small{font-size:14px}
 .help{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:4px 18px 10px}
 @media (max-width:640px){.grid3{grid-template-columns:1fr}.toc{grid-template-columns:1fr}.hero h1{font-size:28px}}
