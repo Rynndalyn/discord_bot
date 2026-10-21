@@ -827,11 +827,19 @@ async function withdraw(user, messageId, campaign) {
   return true;
 }
 
+// People whose DMs Discord refused recently (DMs closed to the server, blocked the bot...). Anyone in here gets email
+// instead, even if their email setting is "Auto", so nothing is lost when a DM bounces.
+const dmClosed = new Set();
+const noteDm = (id, ok) => (ok ? dmClosed.delete(id) : dmClosed.add(id));
 async function dm(user, content) {
   try {
     await user.send(content);
-  } catch {
-    // user has DMs closed — nothing else to do
+    noteDm(user.id, true);
+    return true;
+  } catch (err) {
+    noteDm(user.id, false);
+    log(`Couldn't DM ${user.id}${err.code === 50007 ? ' (DMs closed)' : ''}: ${err.message}`);
+    return false;
   }
 }
 
@@ -1343,8 +1351,10 @@ async function sendInviteDM(discordUserId, rowId, campaignFields, { reminder = f
     const u = await client.users.fetch(discordUserId);
     const e = buildEmbed(campaignFields, { invite: true }).setAuthor({ name: reminder ? '⏰  REMINDER: YOUR INVITATION IS WAITING' : '✉️  YOU’RE INVITED' });
     await u.send({ embeds: [e], components: [inviteRow(rowId)] });
+    noteDm(discordUserId, true);
     return true;
   } catch {
+    noteDm(discordUserId, false);
     return false;
   }
 }
@@ -1671,7 +1681,7 @@ function wantsEmail(cf) {
   const pref = String(cf[M.f.campaignEmails] || 'Auto');
   if (pref.startsWith('Never')) return false;
   if (pref.startsWith('Always')) return true;
-  return !isSnowflake(cf[M.f.discordUserId]);
+  return !isSnowflake(cf[M.f.discordUserId]) || dmClosed.has(cf[M.f.discordUserId]);
 }
 
 async function queueEmail({ creator, subject, body, kind }) {
@@ -1788,6 +1798,7 @@ async function announceConfirmed({ campFields, creatorId, discordUserId, user, h
   const target = user || (isSnowflake(discordUserId) ? await client.users.fetch(discordUserId).catch(() => null) : null);
   const need = postsRequiredOf(campFields);
   const postsNote = need ? `\n\n📝 This campaign asks for **${need} post${need === 1 ? '' : 's'}**${campFields[C.f.postsDueBy] ? ` by ${fmtDate(campFields[C.f.postsDueBy])}` : ''}. Submit each link with \`/submit\`${campFields[C.f.reviewPosts] ? ' (the partner approves each one)' : ''}. Payment comes due once they're all in.` : '';
+  if (!target && isSnowflake(discordUserId)) noteDm(discordUserId, false);
   if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}${postsNote}\n\n${contactMd(campFields)}${extra}`);
   if (creatorId) {
     const contact = await at.first(M.table, { formula: `RECORD_ID()=${at.q(creatorId)}`, fields: CREATOR_CONTACT_FIELDS() });
@@ -2717,10 +2728,7 @@ async function notifyOrg(campFields, { dmText, subject, body, always = false }) 
   let sent = 0;
   for (const id of ids) {
     const u = await client.users.fetch(id).catch(() => null);
-    if (u) {
-      await dm(u, dmText);
-      sent++;
-    }
+    if (u && (await dm(u, dmText))) sent++;
   }
   const { email, name } = leadContact(campFields);
   const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
@@ -2759,7 +2767,8 @@ async function askCreatorToConfirm(r, { reminder = false } = {}) {
   const did = r.fields[K.f.discordUserId];
   if (isSnowflake(did)) {
     const u = await client.users.fetch(did).catch(() => null);
-    await u?.send({ content: text, components: [payButtons(r.id)] }).catch(() => {});
+    if (u) await u.send({ content: text, components: [payButtons(r.id)] }).then(() => noteDm(did, true), () => noteDm(did, false));
+    else noteDm(did, false);
   }
   const cid = first1(r.fields[K.f.creator]);
   if (cid) {
@@ -3422,6 +3431,7 @@ async function tellCreator(krow, text, subject) {
   if (isSnowflake(did)) {
     const u = await client.users.fetch(did).catch(() => null);
     if (u) await dm(u, text);
+    else noteDm(did, false);
   }
   const cid = first1(krow.fields[K.f.creator]);
   if (cid) {
@@ -3505,7 +3515,7 @@ async function notifyPostReviewers(postId) {
     .setDescription(`${p.fields[POSTS.f.platform] || 'Post'}: ${link}\nApprove it if it meets the campaign's requirements, or ask for changes.`);
   for (const id of ids) {
     const u = await client.users.fetch(id).catch(() => null);
-    await u?.send({ embeds: [e], components: [postReviewButtons(p.id)] }).catch(() => {});
+    await u?.send({ embeds: [e], components: [postReviewButtons(p.id)] }).catch((err) => log(`Couldn't DM post review to ${id}: ${err.message}`));
   }
   const { email, name } = leadContact(campFields);
   const orgs = (campFields[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.pageLink]) : [];
