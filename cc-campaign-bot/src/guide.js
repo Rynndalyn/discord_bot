@@ -1,7 +1,7 @@
 // Public how-to guide, served at /guide (and the site root). Edit the text here; no other file needs to change.
 // index.js passes in the shared page CSS and the branded header so this page matches the creator and partner pages.
 
-export function guideHtml({ css, brand, discordInvite = '' }) {
+export function guideHtml({ css, brand, discordInvite = '', signup = '✅' }) {
   const join = discordInvite
     ? `<a class="btn" href="${discordInvite}">Join the Discord</a>`
     : '';
@@ -39,16 +39,16 @@ ${brand}
 <p>Every open campaign has its own post in <b>#active-campaigns</b>. The list shows the topline; click a post for the full brief.</p>
 <ul>
   <li><b>Filter</b> with the tags at the top of the channel: 💰 Paid, 🤝 Unpaid, 🟢 Open, 🙋 Partner-reviewed, plus issue areas.</li>
-  <li><b>Join</b> by reacting ✅ on the campaign post, or with the <b>Join</b> button on your campaigns page.</li>
-  <li><b>Spots</b> on each post counts everyone who's joined, including on the web, so it can be higher than the ✅ count.</li>
+  <li><b>Join</b> by reacting ${signup} on the campaign post, or with the <b>Join</b> button on your campaigns page.</li>
+  <li><b>Spots</b> on each post counts everyone who's joined, including on the web, so it can be higher than the ${signup} count.</li>
   <li><b>Ask questions</b> by replying inside that campaign's post. Keep it on topic and respectful.</li>
 </ul>
 <div class="grid3">
-  <div class="card"><h3>🟢 Open</h3><p>Your ✅ confirms you right away.</p></div>
-  <div class="card"><h3>🙋 Partner-reviewed</h3><p>Your ✅ is a request. The org reviews your profile, and you'll get a DM either way.</p></div>
+  <div class="card"><h3>🟢 Open</h3><p>Your ${signup} confirms you right away.</p></div>
+  <div class="card"><h3>🙋 Partner-reviewed</h3><p>Your ${signup} is a request. The org reviews your profile, and you'll get a DM either way.</p></div>
   <div class="card"><h3>✉️ Invite-only</h3><p>Not listed publicly. If an org invites you, you'll get a DM with <b>Accept</b> / <b>No thanks</b>.</p></div>
 </div>
-<p class="note"><b>Changed your mind?</b> Remove your ✅ to drop out. If you'd already started the work, let the org know in your campaign thread.</p>
+<p class="note"><b>Changed your mind?</b> Remove your ${signup} to drop out. If you'd already started the work, let the org know in your campaign thread.</p>
 
 <h2 id="c-confirmed">3. After you're confirmed</h2>
 <ul>
@@ -100,7 +100,7 @@ ${brand}
 
 <h2 id="p-choose">2. Choose your creators</h2>
 <div class="grid3">
-  <div class="card"><h3>🟢 Open</h3><p>Anyone who reacts ✅ is confirmed. Best for broad reach.</p></div>
+  <div class="card"><h3>🟢 Open</h3><p>Anyone who reacts ${signup} is confirmed. Best for broad reach.</p></div>
   <div class="card"><h3>🙋 Partner-reviewed</h3><p>Each request comes to you with the creator's profile. Approve or decline it by DM, with <code>/review</code> or on your partner page.</p></div>
   <div class="card"><h3>✉️ Invite-only</h3><p>Pick creators yourself from our suggestions, or search the whole network by name, issue, state and reach.</p></div>
 </div>
@@ -163,6 +163,7 @@ table{width:100%;border-collapse:collapse;background:var(--card);border:1px soli
 td{padding:9px 12px;border-top:1px solid var(--line);vertical-align:top}tr:first-child td{border-top:0}td:first-child{white-space:nowrap;width:1%}
 code{background:var(--soft);color:var(--violet);padding:1px 6px;border-radius:6px;font-size:.92em}
 .suggest{margin:12px 0;border-color:var(--accent);background:var(--soft)}.suggest p{color:var(--ink)}
+.emo{height:1.25em;width:auto;vertical-align:-0.25em}
 .muted{color:var(--muted)}.small{font-size:14px}
 .help{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:4px 18px 10px}
 @media (max-width:640px){.grid3{grid-template-columns:1fr}.toc{grid-template-columns:1fr}.hero h1{font-size:28px}}
@@ -201,14 +202,14 @@ Then head to {campaigns} to find your first campaign. The other posts here walk 
     title: '✅ How to join a campaign',
     body: `Every open campaign has its own post in {campaigns}. Use the tags at the top to filter, and click a post for the full brief.
 
-**To join, react ✅ on the campaign post**, or use the **Join** button on your campaigns page.
+**To join, react {signup} on the campaign post**, or use the **Join** button on your campaigns page.
 🟢 **Open:** you're confirmed right away.
-🙋 **Partner-reviewed:** your ✅ is a request. The org reviews your profile, and you'll get a DM either way.
+🙋 **Partner-reviewed:** your {signup} is a request. The org reviews your profile, and you'll get a DM either way.
 ✉️ **Invite-only:** these aren't listed. If an org invites you, you'll get a DM with **Accept** / **No thanks**.
 
-**Spots** on each post counts everyone who's joined, including on the web, so it can be higher than the ✅ count.
+**Spots** on each post counts everyone who's joined, including on the web, so it can be higher than the {signup} count.
 **Questions?** Reply inside the campaign's post.
-**Changed your mind?** Remove your ✅ to drop out. If you'd already started, let the org know in your campaign thread.
+**Changed your mind?** Remove your {signup} to drop out. If you'd already started, let the org know in your campaign thread.
 
 📄 {guide}#c-join`,
   },
@@ -284,7 +285,7 @@ Command replies are private to you. Reactions on campaign posts are public.
     body: `**Your partner page.** Approved orgs get an email with a private partner page link. From it you can review requests, find and invite creators, review posts and mark creators paid, no Discord needed. Treat the link like a password.
 
 **Choosing creators**
-🟢 Open: anyone who reacts ✅ is confirmed.
+🟢 Open: anyone who reacts {signup} is confirmed.
 🙋 Partner-reviewed: approve or decline each request by DM, with \`/review\` or on your partner page.
 ✉️ Invite-only: pick from our suggestions, or search the whole network by name, issue, state and reach with **Find creators** or \`/invite\`. Contact info is shared only after a creator accepts.
 ✨ Suggested creators (any campaign): check **Suggest Creators** on your proposal to get a shortlist of matching creators, with a note on why each fits. Invite the ones you want from your partner page or with \`/invite\`.
