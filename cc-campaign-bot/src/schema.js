@@ -47,6 +47,7 @@ export const CAMPAIGNS = {
     postsDueBy: 'fldQ6Svg1PiyAhWMX',
     reviewPosts: 'fldhh72AAzqK7jQ1v', // org approves each post before it counts
     posts: 'fldivsCtv729Vq0Pe', // inverse link to Campaign Posts
+    suggestOptIn: 'fldnXDAAdPvQStN7K', // Suggest Creators: shortlist + invites on any campaign, not just invite-only
   },
   names: {
     status: 'Active / Inactive',
@@ -64,6 +65,7 @@ export const CAMPAIGNS = {
     postToDiscord: 'Post to Discord',
     discordMessageId: 'Discord Message ID',
     discordClosed: 'Discord Closed',
+    suggestOptIn: 'Suggest Creators',
   },
   ACTIVE: '🟢 Active',
 };
