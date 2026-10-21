@@ -167,3 +167,118 @@ code{background:var(--soft);color:var(--violet);padding:1px 6px;border-radius:6p
 .help{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:4px 18px 10px}
 @media (max-width:640px){.grid3{grid-template-columns:1fr}.toc{grid-template-columns:1fr}.hero h1{font-size:28px}}
 `;
+
+// ---------- The same guide inside Discord ----------
+// The bot keeps one post per topic in the channel set by GUIDE_CHANNEL_ID (a Forum works best), creating any that are
+// missing and updating any whose text changed here. {guide} becomes the guide page link, {campaigns} the campaigns channel.
+export const DISCORD_GUIDE = [
+  {
+    title: '🚀 Start here: get set up',
+    pin: true,
+    body: `**Welcome to Creator Congress campaigns!** Partner organizations post paid and volunteer campaigns, and creators join, post and get paid. Three things to do once:
+
+**1. Link your account**
+Click **Join on Discord** on your campaigns page, or type \`/link\` followed by the email you applied with. This connects your Discord to your Creator Congress profile.
+
+**2. Turn on DMs**
+The bot sends confirmations, invitations and payment check-ins by DM. Right-click the server icon → **Privacy Settings** → turn on **Direct Messages**.
+
+**3. Bookmark your campaigns page**
+Your approval email has a private link to your campaigns page. It shows everything you've joined, your posts and your payments.
+
+Then head to {campaigns} to find your first campaign. The other posts here walk through each step.
+📄 Full guide: {guide}`,
+  },
+  {
+    title: '✅ How to join a campaign',
+    body: `Every open campaign has its own post in {campaigns}. Use the tags at the top to filter, and click a post for the full brief.
+
+**To join, react ✅ on the campaign post**, or use the **Join** button on your campaigns page.
+🟢 **Open:** you're confirmed right away.
+🙋 **Partner-reviewed:** your ✅ is a request. The org reviews your profile, and you'll get a DM either way.
+✉️ **Invite-only:** these aren't listed. If an org invites you, you'll get a DM with **Accept** / **No thanks**.
+
+**Spots** on each post counts everyone who's joined, including on the web, so it can be higher than the ✅ count.
+**Questions?** Reply inside the campaign's post.
+**Changed your mind?** Remove your ✅ to drop out. If you'd already started, let the org know in your campaign thread.
+
+📄 {guide}#c-join`,
+  },
+  {
+    title: "🤝 After you're confirmed",
+    body: `Once you're confirmed:
+
+• You're added to a **private thread** with the partner org. That's where the brief, questions and coordination happen.
+• Your **lead contact** and the org's **payment details** (how to invoice them or what they need from you) appear in that thread, on your campaigns page and in \`/mycampaigns\`.
+• Keep contact and payment details from your thread private.
+
+📄 {guide}#c-confirmed`,
+  },
+  {
+    title: '📝 How to submit your posts',
+    body: `If a campaign asks for posts, log each one as soon as it's live.
+
+**1.** Type \`/submit\`, paste your post link and pick the campaign.
+**2.** Attach a screenshot of the post's insights (views, likes, comments, shares) if you can. We read the numbers automatically.
+**3.** Some orgs review posts before they count. If they ask for changes, you'll get a DM with their note. Fix it and submit again.
+
+You can also submit from your campaigns page. Check your progress (like *2 of 3 posts*) in \`/mycampaigns\`.
+
+📄 {guide}#c-posts`,
+  },
+  {
+    title: '💸 How you get paid',
+    body: `⏳ Not due yet → 📝 Waiting on posts → 💸 Payment due → 🏢 Org says paid → ✅ Paid
+
+• **When:** payment is due within **30 days** after the campaign ends. If posts are required, it comes due once all of yours are in.
+• **Confirm it arrived:** when the org marks you paid, you'll get a DM. Tap **Yes, I got paid**. You can also confirm on your campaigns page.
+• **No reply in 14 days?** It's marked paid automatically.
+• **Not paid, or the amount's wrong?** Tap **Not yet** and add a note. Our team follows up with the org.
+
+Pay shown in \`/mycampaigns\` is an estimate until the org confirms.
+📄 {guide}#c-paid`,
+  },
+  {
+    title: '⌨️ Commands',
+    body: `**For creators**
+\`/link\` – connect your Discord to your profile (one time)
+\`/mycampaigns\` – your campaigns, invitations, post progress and payment status
+\`/submit\` – log a post for a campaign
+\`/help\` – quick summary
+
+**For partner orgs**
+\`/link\` – connect with your organization's application email
+\`/roster\` – who's signed up for your campaigns
+\`/review\` – approve or decline requests to join
+\`/invite\` – invite suggested creators, or search anyone by name
+\`/payments\` – payment status, and mark creators paid
+
+Command replies are private to you. Reactions on campaign posts are public.
+📄 {guide}`,
+  },
+  {
+    title: '🏢 For partner organizations',
+    body: `**Your partner page.** Approved orgs get an email with a private partner page link. From it you can review requests, find and invite creators, review posts and mark creators paid, no Discord needed. Treat the link like a password.
+
+**Choosing creators**
+🟢 Open: anyone who reacts ✅ is confirmed.
+🙋 Partner-reviewed: approve or decline each request by DM, with \`/review\` or on your partner page.
+✉️ Invite-only: pick from our suggestions, or search the whole network by name, issue, state and reach with **Find creators** or \`/invite\`. Contact info is shared only after a creator accepts.
+✨ Suggested creators (any campaign): check **Suggest Creators** on your proposal to get a shortlist of matching creators, with a note on why each fits. Invite the ones you want from your partner page or with \`/invite\`.
+
+**Reviewing posts.** If post review is on, approve each post or ask for changes. Only approved posts count.
+
+**Paying creators.** Payment is due within 30 days after the campaign ends, once required posts are in. Click **Mark paid** (or \`/payments\`). It shows as Paid once the creator confirms, or after 14 days.
+
+📄 {guide}#partners`,
+  },
+  {
+    title: '🆘 Need help?',
+    body: `• **About a campaign:** ask in that campaign's post, or in your private campaign thread once you're confirmed.
+• **About payment or anything personal:** use your private thread, or message a Creator Congress team member.
+• **Partner orgs:** reply to any Creator Congress email.
+
+Be respectful to partner orgs, staff and other creators. Our code of conduct applies everywhere.
+📄 Full guide: {guide}`,
+  },
+];
