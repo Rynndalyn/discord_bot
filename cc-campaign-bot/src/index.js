@@ -26,7 +26,7 @@ import {
 import { createServer } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import * as at from './airtable.js';
-import { CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL } from './schema.js';
+import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS } from './schema.js';
 
 const {
   DISCORD_TOKEN,
@@ -149,6 +149,9 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
   if (tags.length) e.addFields({ name: '🏷️ Focus', value: tags.map((t) => `\`${t}\``).join('  ').slice(0, 1000) });
   if (modeOf(fields) === 'review' && !closed) {
     e.addFields({ name: '🙋 Partner-reviewed', value: `${org || 'The partner'} reviews each sign-up. React to request a spot, and you'll get a DM once you're confirmed.` });
+  }
+  if (postsRequiredOf(fields) && !closed) {
+    e.addFields({ name: '📝 Posts', value: `${postsRequiredOf(fields)} post${postsRequiredOf(fields) === 1 ? '' : 's'} per creator${fields[C.f.postsDueBy] ? `, due ${fmtDate(fields[C.f.postsDueBy])}` : ''}${fields[C.f.reviewPosts] ? ' · reviewed by the partner' : ''}`, inline: false });
   }
   if (hasThread(fields) && !closed) {
     e.addFields({ name: '💬 Campaign thread', value: 'Once you’re confirmed, you’re added to a private thread for this campaign in the partner’s Discord channel.' });
@@ -1587,7 +1590,9 @@ async function announceConfirmed({ campFields, creatorId, discordUserId, user, h
   const name = campFields[C.f.shortName] || 'the campaign';
   const channelNote = hasThread(campFields) ? ' You’ll be added to the campaign’s private thread in the partner’s channel in a moment.' : '';
   const target = user || (isSnowflake(discordUserId) ? await client.users.fetch(discordUserId).catch(() => null) : null);
-  if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}\n\n${contactMd(campFields)}${extra}`);
+  const need = postsRequiredOf(campFields);
+  const postsNote = need ? `\n\n📝 This campaign asks for **${need} post${need === 1 ? '' : 's'}**${campFields[C.f.postsDueBy] ? ` by ${fmtDate(campFields[C.f.postsDueBy])}` : ''}. Submit each link with \`/submit\`${campFields[C.f.reviewPosts] ? ' (the partner approves each one)' : ''}. Payment comes due once they're all in.` : '';
+  if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}${postsNote}\n\n${contactMd(campFields)}${extra}`);
   if (creatorId) {
     const contact = await at.first(M.table, { formula: `RECORD_ID()=${at.q(creatorId)}`, fields: CREATOR_CONTACT_FIELDS() });
     if (contact) await emailDecision(contact, campFields, true).catch((err) => log('email error', err));
@@ -1625,7 +1630,9 @@ async function emailDecision(creator, campFields, approved) {
     kind: approved ? 'Confirmed' : 'Not selected',
     subject: approved ? `You're in: ${campaignName}` : `Update on ${campaignName}`,
     body: approved
-      ? `${hi(cf)}\n\nGood news: you've been confirmed for **${campaignName}**!\n\n${contactMd(campFields, { email: true })}` +
+      ? `${hi(cf)}\n\nGood news: you've been confirmed for **${campaignName}**!\n\n` +
+        (postsRequiredOf(campFields) ? `This campaign asks for **${postsRequiredOf(campFields)} post(s)**${campFields[C.f.postsDueBy] ? ` by ${fmtDate(campFields[C.f.postsDueBy])}` : ''}. Submit each link on your campaigns page. Payment comes due once they're all in.\n\n` : '') +
+        `${contactMd(campFields, { email: true })}` +
         (longTerm ? '\n\nThis campaign coordinates in a private Discord thread in the partner’s channel. If you’re not on Discord, the team will help you get set up or keep you updated by email.' : '') +
         pageLine(cf)
       : `${hi(cf)}\n\nThanks so much for your interest in **${campaignName}**. The partner wasn't able to bring you on for this one, but that's no reflection on your work. Partners often have very specific needs for each campaign.\n\nThere are always more opportunities coming. We'd love to see you on the next one!` +
@@ -1861,11 +1868,13 @@ textarea,input{font:inherit;border:1px solid var(--line);border-radius:8px;paddi
 .row{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
 .row-main{flex:1 1 260px;min-width:0}.row-main a{color:var(--accent);word-break:break-all}
 .paystat{font-size:14px;margin-top:2px}.paystat.paid{color:var(--ok)}.paystat.issue{color:#b42318}.paystat.paymentdue{color:var(--warn)}
+.posts{margin:12px 0 4px;padding:10px 14px;border-radius:10px;border:1px solid var(--line);background:var(--card)}.postlist{margin:6px 0;padding-left:20px}.postlist a{color:var(--accent)}
+.postform{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:8px}.postform input[type=url]{flex:1 1 240px}
 .findform{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.findform input{flex:1 1 180px}select{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--ink);max-width:100%}
 .markpaid{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.markpaid label{font-size:14px;color:var(--muted)}.markpaid input[name=note]{flex:1 1 180px}
 `;
 
-function campaignCard(p, { mineRow, inviteRow, token }) {
+function campaignCard(p, { mineRow, inviteRow, token, posts = [] }) {
   const f = p.fields;
   const name = esc(f[C.f.shortName] || 'Campaign');
   const org = (f[C.f.orgName] || []).filter(Boolean).join(', ');
@@ -1903,7 +1912,7 @@ function campaignCard(p, { mineRow, inviteRow, token }) {
   ${details ? `<details><summary>Campaign details</summary><p>${esc(details)}</p></details>` : ''}
   ${mode === 'review' && !inviteRow ? `<div class="note">🙋 Partner-reviewed: ${esc(org || 'the partner')} approves each creator. You'll be emailed when you're confirmed.</div>` : ''}
   ${inviteRow ? `<div class="note violet">✉️ You were personally invited to this campaign.</div>` : ''}
-  ${status === 'Committed' ? paymentHtml(mineRow, token) + contactHtml(f) : ''}
+  ${status === 'Committed' ? postsHtml(mineRow, posts, token) + paymentHtml(mineRow, token) + contactHtml(f) : ''}
   ${hasThread(f) ? `<div class="note violet">💬 Confirmed creators join a private Discord thread with the partner. Not on Discord? The team will keep you posted by email.</div>` : ''}
   <div class="actions">${actions}</div>
 </div>`;
@@ -1920,6 +1929,12 @@ const FLASH = {
   full: 'Sorry, that campaign just filled up.',
   closed: 'That campaign has closed.',
   answered: "You've already responded to that invitation.",
+  postcounted: '✅ Post recorded. Thanks!',
+  postreview: '📝 Post submitted. The partner reviews each post, and you’ll hear back once it’s approved.',
+  badlink: "That doesn't look like a link. Paste the full post URL.",
+  duplicate: "You've already submitted that link.",
+  notconfirmed: "You're not confirmed on that campaign.",
+  noposts: "That campaign doesn't track posts.",
   confirmedpaid: "✅ Thanks for confirming you were paid! We've let the partner know.",
   reported: "Thanks for letting us know. The partner and the Creator Congress team have been alerted, and someone will follow up.",
   alreadypaid: 'That payment is already confirmed.',
@@ -1929,8 +1944,10 @@ const FLASH = {
 async function renderCreatorPage(creator, token, flash) {
   const cf = creator.fields;
   const mine = (cf[M.f.commitments] || []).length
-    ? await listByIds(K.table, cf[M.f.commitments], [...PAY_FIELDS(), K.f.discordMessageId])
+    ? await listByIds(K.table, cf[M.f.commitments], [...PAY_FIELDS(), K.f.discordMessageId, K.f.posts, K.f.postsDueBy])
     : [];
+  const postIds = [...new Set(mine.filter((r) => r.fields[K.f.status] === 'Committed').flatMap((r) => r.fields[K.f.posts] || []))];
+  const allPosts = postIds.length ? await listByIds(POSTS.table, postIds, POST_FIELDS()) : [];
   const open = await listOpenCampaigns();
   const campIds = [...new Set(mine.map((r) => first1(r.fields[K.f.campaign])).filter(Boolean))];
   const allCamps = new Map(open.map((p) => [p.id, p]));
@@ -1965,11 +1982,11 @@ ${flash && FLASH[flash] ? `<div class="flash">${esc(FLASH[flash])}</div>` : ''}
 </div>
 ${toConfirm.some((x) => payStatusOf(x.r) === 'Org says paid') ? `<div class="flash">💸 A partner says they've paid you. Please confirm below whether it arrived.</div>` : ''}
 ${invites.length ? section('✉️ Your invitations', invites.map((x) => campaignCard(x.p, { inviteRow: x.r, token })).join('')) : ''}
-${section('Open campaigns', browse.length ? browse.map((p) => campaignCard(p, { mineRow: rowFor(p), token })).join('') : '<p class="empty">No open campaigns right now. We’ll email you when new ones are posted.</p>')}
-${activeMine.length ? section('Your active campaigns', activeMine.map((x) => campaignCard(x.p, { mineRow: x.r, token })).join('')) : ''}
-${pastMine.length ? section('Past campaigns', `<div class="card">${pastMine.map((x) => `<div class="past">✓ <b>${esc(x.p.fields[C.f.shortName])}</b>${payOf(x) ? ` · ${esc(money(payOf(x)))}` : ''}${paymentHtml(x.r, token)}<details><summary>Contact &amp; payment details</summary>${contactHtml(x.p.fields)}</details></div>`).join('')}</div>`) : ''}
+${section('Open campaigns', browse.length ? browse.map((p) => campaignCard(p, { mineRow: rowFor(p), token, posts: allPosts })).join('') : '<p class="empty">No open campaigns right now. We’ll email you when new ones are posted.</p>')}
+${activeMine.length ? section('Your active campaigns', activeMine.map((x) => campaignCard(x.p, { mineRow: x.r, token, posts: allPosts })).join('')) : ''}
+${pastMine.length ? section('Past campaigns', `<div class="card">${pastMine.map((x) => `<div class="past">✓ <b>${esc(x.p.fields[C.f.shortName])}</b>${payOf(x) ? ` · ${esc(money(payOf(x)))}` : ''}${postsHtml(x.r, allPosts, token)}${paymentHtml(x.r, token)}<details><summary>Contact &amp; payment details</summary>${contactHtml(x.p.fields)}</details></div>`).join('')}</div>`) : ''}
 <footer>Expected pay is an estimate based on campaign rates. "Paid so far" counts payments you've confirmed you received. This page is private to you, so please don't share the link. Prefer Discord? Join our server and use <b>/link</b> with this email. Questions? Reply to any Creator Congress email.</footer>`;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Your campaigns · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Your campaigns · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div>${POST_FORM_JS}</body></html>`;
 }
 
 async function creatorByToken(token) {
@@ -1993,6 +2010,20 @@ function startWebServer() {
     try {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return send(res, 200, 'ok', { 'Content-Type': 'text/plain' });
+      // Partner page: review a submitted post
+      const pr = url.pathname.match(/^\/o\/([a-f0-9]{32})\/post\/(rec[A-Za-z0-9]{14})\/(approve|changes)\/?$/);
+      if (pr && req.method === 'POST') {
+        const [, otoken, postId, verdict] = pr;
+        const org = await orgByToken(otoken);
+        if (!org || !org.fields[O.f.approved]) return send(res, 404, simple('Link not recognized', 'This link may have expired.'));
+        const form = await readForm(req);
+        const ids = org.fields[O.f.proposals] || [];
+        const props = ids.length ? await listByIds(C.table, ids, [C.f.posts]) : [];
+        const ours = props.some((p) => (p.fields[C.f.posts] || []).includes(postId));
+        const result = ours ? await reviewPost(postId, verdict === 'approve', `${org.fields[O.f.organization] || 'Org'} (partner page)`, form.note) : 'missing';
+        res.writeHead(303, { Location: `/o/${otoken}?done=${encodeURIComponent(result)}#posts`, 'Cache-Control': 'no-store' });
+        return res.end();
+      }
       // Partner (org) page
       const om = url.pathname.match(/^\/o\/([a-f0-9]{32})(?:\/paid\/(rec[A-Za-z0-9]{14})|\/review\/(rec[A-Za-z0-9]{14})\/(approve|decline)|\/(invite|skip)\/(rec[A-Za-z0-9]{14})\/(rec[A-Za-z0-9]{14})|\/invitepick\/(rec[A-Za-z0-9]{14}))?\/?$/);
       if (om) {
@@ -2043,6 +2074,23 @@ function startWebServer() {
         }
         if (req.method !== 'GET') return send(res, 405, simple('Not allowed', ''));
         return send(res, 200, await renderOrgPage(org, otoken, url.searchParams.get('done'), { query: Object.fromEntries(url.searchParams) }));
+      }
+      // Creator: submit a post (optionally with an insights screenshot as base64)
+      const sp = url.pathname.match(/^\/c\/([a-f0-9]{32})\/post\/(rec[A-Za-z0-9]{14})\/?$/);
+      if (sp && req.method === 'POST') {
+        const [, ptoken, rowId] = sp;
+        const creator = await creatorByToken(ptoken);
+        if (!creator || !creator.fields[M.f.approved]) return send(res, 404, simple('Link not recognized', 'This link may have expired.'));
+        const form = await readForm(req, 8_000_000);
+        let result = 'notconfirmed';
+        if ((creator.fields[M.f.commitments] || []).includes(rowId)) {
+          const shot = form.shot && /^image\//.test(form.shotType || '') && form.shot.length < 6_500_000
+            ? { base64: form.shot, contentType: form.shotType, filename: String(form.shotName || 'insights.png').slice(0, 100) }
+            : null;
+          ({ result } = await submitPost({ krowId: rowId, link: form.link, via: 'Web page', screenshot: shot }));
+        }
+        res.writeHead(303, { Location: `/c/${ptoken}?done=${encodeURIComponent(result)}`, 'Cache-Control': 'no-store' });
+        return res.end();
       }
       // Creator: confirm or report a payment
       const pm = url.pathname.match(/^\/c\/([a-f0-9]{32})\/pay\/(rec[A-Za-z0-9]{14})\/(yes|no)\/?$/);
@@ -2238,8 +2286,9 @@ const PAY_FIELDS = () => [
   K.f.title, K.f.status, K.f.campaign, K.f.creator, K.f.discordUserId, K.f.creatorName, K.f.campaignName, K.f.campaignStatus,
   K.f.campaignPay, K.f.campaignEndDate, K.f.orgName, K.f.creatorEmail, K.f.paymentStatus, K.f.amountPaid, K.f.orgPaidAt,
   K.f.orgPaidBy, K.f.paymentNote, K.f.creatorAskedAt, K.f.paidConfirmedAt, K.f.paidConfirmedBy, K.f.paymentReminders,
-  K.f.paymentFlagged, K.f.paymentDueDate,
+  K.f.paymentFlagged, K.f.paymentDueDate, K.f.postsRequired, K.f.postsAccepted, K.f.postsCompletedAt,
 ];
+const dueDateOf = (r) => String(r.fields[K.f.paymentDueDate] || '').slice(0, 10) || null;
 
 const todayEt = () => new Date().toLocaleDateString('en-CA', { timeZone: 'America/New_York' }); // YYYY-MM-DD
 const daysSince = (iso) => (iso ? (Date.now() - new Date(iso).getTime()) / 86_400_000 : 0);
@@ -2254,19 +2303,26 @@ function campaignEnded(r) {
   return first1(r.fields[K.f.campaignStatus]) !== C.ACTIVE;
 }
 // What the creator/org should see, even before the bot has written a status.
+// Campaigns that require posts: payment waits until all of the creator's posts are in.
+function basePayStatus(r) {
+  const required = Number(first1(r.fields[K.f.postsRequired])) || 0;
+  if (required > 0) return (Number(r.fields[K.f.postsAccepted]) || 0) >= required ? 'Payment due' : 'Waiting on posts';
+  return campaignEnded(r) ? 'Payment due' : 'Not due yet';
+}
 function payStatusOf(r) {
   const s = r.fields[K.f.paymentStatus];
-  if (s && s !== 'Not due yet') return s;
-  return campaignEnded(r) ? 'Payment due' : 'Not due yet';
+  if (s && !['Not due yet', 'Waiting on posts', 'Payment due'].includes(s)) return s;
+  return basePayStatus(r);
 }
 const PAY_LABEL = {
   'Not due yet': '⏳ Not due yet',
+  'Waiting on posts': '📝 Waiting on posts',
   'Payment due': '💸 Payment due',
   'Org says paid': '📤 Org says paid',
   Paid: '✅ Paid',
   Issue: '⚠️ Payment issue',
 };
-const PAY_EMOJI = { 'Not due yet': '⏳', 'Payment due': '💸', 'Org says paid': '📤', Paid: '✅', Issue: '⚠️' };
+const PAY_EMOJI = { 'Waiting on posts': '📝', 'Not due yet': '⏳', 'Payment due': '💸', 'Org says paid': '📤', Paid: '✅', Issue: '⚠️' };
 const stamp = () => new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'America/New_York' });
 const addNote = (r, who, note) => {
   const n = String(note || '').trim();
@@ -2405,7 +2461,7 @@ async function reportNotPaid(rowId, { note } = {}) {
   if (!r || r.fields[K.f.status] !== 'Committed') return 'missing';
   const st = r.fields[K.f.paymentStatus];
   if (st === 'Paid' && r.fields[K.f.paidConfirmedBy] === 'Creator') return 'alreadypaid';
-  if (!campaignEnded(r) && st !== 'Org says paid') return 'notdue';
+  if (basePayStatus(r) !== 'Payment due' && st !== 'Org says paid' && st !== 'Paid') return 'notdue';
   await at.update(K.table, r.id, {
     [K.f.paymentStatus]: 'Issue',
     [K.f.paymentNote]: addNote(r, 'Creator', note || 'Says they have not received payment yet.'),
@@ -2455,10 +2511,10 @@ async function paymentTick() {
         }
         continue;
       }
-      // Not due yet / Payment due
-      const want = campaignEnded(r) ? 'Payment due' : 'Not due yet';
+      // Not due yet / Waiting on posts / Payment due
+      const want = basePayStatus(r);
       if (st !== want) await at.update(K.table, r.id, { [K.f.paymentStatus]: want });
-      const due = r.fields[K.f.paymentDueDate];
+      const due = dueDateOf(r);
       if (want !== 'Payment due' || !due || due >= today) continue;
       if (due < PAY.START) continue; // older campaigns: no overdue nagging; staff/creators can still mark them paid
       const late = (new Date(today) - new Date(due)) / 86_400_000;
@@ -2573,7 +2629,7 @@ async function handlePayments(interaction) {
   rows = rows.filter((r) => r.fields[K.f.status] === 'Committed' && isPaidCampaignRow(r));
   if (!rows.length) return interaction.editReply('No paid campaigns with confirmed creators yet.');
 
-  const order = { Issue: 0, 'Payment due': 1, 'Org says paid': 2, 'Not due yet': 3, Paid: 4 };
+  const order = { Issue: 0, 'Payment due': 1, 'Org says paid': 2, 'Waiting on posts': 3, 'Not due yet': 4, Paid: 5 };
   rows.sort((a, b) => order[payStatusOf(a)] - order[payStatusOf(b)] || rowCampName(a).localeCompare(rowCampName(b)));
   const byCamp = new Map();
   for (const r of rows) {
@@ -2594,6 +2650,7 @@ async function handlePayments(interaction) {
         `📤 **${count('Org says paid')}** waiting on creator`,
         `💸 **${count('Payment due')}** due${owedTotal ? ` (${money(owedTotal)} incl. issues)` : ''}`,
         count('Issue') ? `⚠️ **${count('Issue')}** issue${count('Issue') === 1 ? '' : 's'}` : null,
+        count('Waiting on posts') ? `📝 **${count('Waiting on posts')}** waiting on posts` : null,
         count('Not due yet') ? `⏳ **${count('Not due yet')}** not due yet` : null,
       ].filter(Boolean).join('   ·   ')
     );
@@ -2602,7 +2659,7 @@ async function handlePayments(interaction) {
     let value = list
       .map((r) => {
         const st = payStatusOf(r);
-        const due = r.fields[K.f.paymentDueDate];
+        const due = dueDateOf(r);
         const extra = st === 'Payment due' && due ? ` · due ${fmtDate(due)}` : st === 'Org says paid' ? ' · waiting on creator' : '';
         const who = isSnowflake(r.fields[K.f.discordUserId]) ? ` <@${r.fields[K.f.discordUserId]}>` : '';
         return `${PAY_EMOJI[st]} ${rowCreatorName(r)}${who} · ${money(rowAmount(r))}${extra}`;
@@ -2615,7 +2672,7 @@ async function handlePayments(interaction) {
   }
   const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
   e.setFooter({ text: 'Paid = the creator confirmed it (or no reply 14 days after you marked it). Only you can see this.' });
-  const actionable = rows.filter((r) => ['Payment due', 'Issue', 'Not due yet'].includes(payStatusOf(r))).slice(0, 20);
+  const actionable = rows.filter((r) => ['Payment due', 'Issue', 'Not due yet', 'Waiting on posts'].includes(payStatusOf(r))).slice(0, 20);
   const components = [];
   for (let i = 0; i < actionable.length; i += 4) {
     components.push(
@@ -2654,6 +2711,9 @@ async function orgByToken(token) {
 
 const ORG_FLASH = {
   approved: '✅ Approved. The creator has been told and added to the campaign.',
+  postapproved: '✅ Post approved. The creator has been told.',
+  postchanges: '✏️ Sent. The creator has been asked to submit an updated post.',
+  postdecided: 'Someone already reviewed that post.',
   declined: 'Declined. The creator was sent a kind note; no reason was shared.',
   decided: 'Someone already made a decision on that request.',
   invited: '✉️ Invited. Their invitation goes out within 2 minutes (once the campaign is live).',
@@ -2669,6 +2729,26 @@ async function renderOrgPage(org, token, flash, opts = {}) {
   const rowIds = [...new Set(props.flatMap((p) => p.fields[C.f.commitments] || []))];
   const rows = (rowIds.length ? await listByIds(K.table, rowIds, PAY_FIELDS()) : []).filter((r) => r.fields[K.f.status] === 'Committed');
   props.sort((a, b) => (b.fields[C.f.status] === C.ACTIVE) - (a.fields[C.f.status] === C.ACTIVE));
+  const orgPostIds = [...new Set(props.flatMap((p) => p.fields[C.f.posts] || []))];
+  const orgPosts = orgPostIds.length ? await listByIds(POSTS.table, orgPostIds, POST_FIELDS()) : [];
+  const toReview = orgPosts.filter((p) => p.fields[POSTS.f.status] === 'Submitted');
+  const postsReviewHtml = toReview.length
+    ? `<h2 id="posts">📝 Posts to review (${toReview.length})</h2>` +
+      toReview
+        .map((p) => `<div class="card"><p><b>${esc(p.fields[POSTS.f.title] || 'Post')}</b></p>
+  <p><a href="${esc(p.fields[POSTS.f.link])}" target="_blank" rel="noopener">${esc(p.fields[POSTS.f.platform] || 'Open post')} ↗</a> <span class="muted">${esc(p.fields[POSTS.f.link])}</span></p>
+  <div class="actions"><form method="post" action="/o/${token}/post/${p.id}/approve"><button class="primary">✅ Approve post</button></form></div>
+  <details class="notpaid"><summary>Ask for changes</summary><form method="post" action="/o/${token}/post/${p.id}/changes"><textarea name="note" rows="2" maxlength="500" required placeholder="What needs to change?"></textarea><button>Send to creator</button></form></details></div>`)
+        .join('')
+    : '';
+  const postLine = (r) => {
+    const required = rowPostsRequired(r);
+    if (!required) return '';
+    const mineP = orgPosts.filter((p) => (p.fields[POSTS.f.commitment] || []).includes(r.id));
+    const icon = { Approved: '✅', Submitted: '⏳', 'Needs changes': '✏️' };
+    const links = mineP.map((p) => `<a href="${esc(p.fields[POSTS.f.link])}" target="_blank" rel="noopener" title="${esc(p.fields[POSTS.f.status] || '')}">${icon[p.fields[POSTS.f.status]] || '•'} ${esc(p.fields[POSTS.f.platform] || 'post')}</a>`);
+    return `<div class="muted">📝 Posts ${rowPostsAccepted(r)} of ${required}${links.length ? ` · ${links.join(' · ')}` : ''}</div>`;
+  };
   const paidRows = rows.filter((r) => isPaidCampaignRow(r));
   const tot = (s) => paidRows.filter((r) => payStatusOf(r) === s).reduce((t, r) => t + rowAmount(r), 0);
   const cnt = (s) => paidRows.filter((r) => payStatusOf(r) === s).length;
@@ -2780,11 +2860,12 @@ async function renderOrgPage(org, token, flash, opts = {}) {
               const paid = isPaidCampaignRow(r);
               const email = first1(r.fields[K.f.creatorEmail]);
               const note = String(r.fields[K.f.paymentNote] || '').trim();
-              const canMark = paid && ['Not due yet', 'Payment due', 'Issue'].includes(st);
-              const due = r.fields[K.f.paymentDueDate];
+              const canMark = paid && ['Not due yet', 'Waiting on posts', 'Payment due', 'Issue'].includes(st);
+              const due = dueDateOf(r);
               return `<div class="row">
   <div class="row-main"><b>${esc(rowCreatorName(r))}</b>${email ? ` · <a href="mailto:${esc(email)}?subject=${encodeURIComponent(f[C.f.shortName] || 'Creator Congress')}">${esc(email)}</a>` : ''}
     ${paid ? `<div class="paystat ${st.replace(/\W+/g, '').toLowerCase()}">${esc(PAY_LABEL[st])} · ${esc(money(rowAmount(r)))}${st === 'Payment due' && due ? ` · due ${esc(fmtDate(due))}` : ''}${st === 'Org says paid' ? ' · waiting for the creator to confirm' : ''}</div>` : '<div class="muted">Unpaid campaign</div>'}
+    ${postLine(r)}
     ${note ? `<details><summary>Payment notes</summary><p>${esc(note)}</p></details>` : ''}
   </div>
   ${canMark ? `<form method="post" action="/o/${token}/paid/${r.id}" class="markpaid">
@@ -2812,6 +2893,7 @@ ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>
 </div>
 <div class="flash">How payment confirmation works: after you pay a creator, click <b>Mark paid</b>. They're asked to confirm it arrived. It shows as <b>✅ Paid</b> once they confirm, or automatically if they don't reply within 14 days. Payments are due within 30 days of the campaign's end date.</div>
 ${reviewHtml}
+${postsReviewHtml}
 ${suggestHtml}
 ${findHtml}
 <h2>Your campaigns</h2>
@@ -2821,12 +2903,12 @@ ${campHtml || '<p class="empty">No campaigns yet.</p>'}
 }
 
 // Read a small urlencoded form body.
-function readForm(req) {
+function readForm(req, maxBytes = 10_000) {
   return new Promise((resolve) => {
     let data = '';
     req.on('data', (c) => {
       data += c;
-      if (data.length > 10_000) req.destroy();
+      if (data.length > maxBytes) req.destroy();
     });
     req.on('end', () => resolve(Object.fromEntries(new URLSearchParams(data))));
     req.on('error', () => resolve({}));
@@ -2838,13 +2920,14 @@ function paymentHtml(r, token) {
   if (!r || !isPaidCampaignRow(r)) return '';
   const st = payStatusOf(r);
   const amount = money(rowAmount(r));
-  const due = r.fields[K.f.paymentDueDate];
+  const due = dueDateOf(r);
   const orgNote = String(r.fields[K.f.paymentNote] || '').split('\n').filter((l) => l.startsWith('Org')).pop();
   const yes = `<form method="post" action="/c/${token}/pay/${r.id}/yes"><button class="primary">✅ Yes, I got paid</button></form>`;
   const no = `<details class="notpaid"><summary>I haven't been paid</summary><form method="post" action="/c/${token}/pay/${r.id}/no"><textarea name="note" rows="2" maxlength="500" placeholder="Anything we should know? (optional)"></textarea><button>Report it</button></form></details>`;
   const lines = {
     'Not due yet': `Payment is due within 30 days after the campaign ends${due ? ` (by ${esc(fmtDate(due))})` : ''}.`,
-    'Payment due': `The campaign has ended. Payment is due${due ? ` by ${esc(fmtDate(due))}` : ''}. Already received it? Let us know.`,
+    'Waiting on posts': `Payment is due within 30 days after all your required posts are in. Submit them above.`,
+    'Payment due': `${Number(first1(r.fields[K.f.postsRequired])) > 0 ? 'Your posts are all in.' : 'The campaign has ended.'} Payment is due${due ? ` by ${esc(fmtDate(due))}` : ''}. Already received it? Let us know.`,
     'Org says paid': `<b>The partner says they sent ${esc(amount)}.</b> Did it arrive?${orgNote ? `<br><span class="muted">${esc(orgNote.replace(/^Org \([^)]*\): /, ''))}</span>` : ''}`,
     Paid: r.fields[K.f.paidConfirmedBy] === 'Creator' ? `You confirmed you received ${esc(amount)}. Thank you!` : `Counted as received. Not right? Let us know.`,
     Issue: 'You reported a problem with this payment. The partner and our team have been alerted.',
@@ -2855,6 +2938,401 @@ function paymentHtml(r, token) {
   else if (st === 'Issue') actions = yes;
   return `<div class="pay ${st.replace(/\W+/g, '').toLowerCase()}"><div class="contact-h">Payment · ${esc(PAY_LABEL[st])}${amount ? ` · ${esc(amount)}` : ''}</div><p>${lines[st]}</p>${actions ? `<div class="actions">${actions}</div>` : ''}</div>`;
 }
+
+// ---------- post tracking: creators submit their campaign posts; orgs approve (optional); payment waits ----------
+// Campaign fields: Posts Required, Posts Due By, Review Posts. One row per post in Campaign Posts, and a
+// matching row in Creator Post Analysis for performance numbers (read from an insights screenshot by Airtable AI).
+
+const postsRequiredOf = (f) => Number(first1(f?.[C.f.postsRequired] ?? f?.[K.f.postsRequired])) || 0;
+const rowPostsRequired = (r) => Number(first1(r.fields[K.f.postsRequired])) || 0;
+const rowPostsAccepted = (r) => Number(r.fields[K.f.postsAccepted]) || 0;
+const postsComplete = (r) => rowPostsRequired(r) > 0 && rowPostsAccepted(r) >= rowPostsRequired(r);
+
+function normalizeLink(raw) {
+  let u = String(raw || '').trim();
+  if (!u) return null;
+  if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+  try {
+    const url = new URL(u);
+    if (!/\./.test(url.hostname)) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+function detectPlatform(link) {
+  const h = (() => { try { return new URL(link).hostname.toLowerCase(); } catch { return ''; } })();
+  if (/tiktok\.com$/.test(h)) return 'TikTok';
+  if (/(instagram\.com|instagr\.am)$/.test(h)) return 'Instagram';
+  if (/(youtube\.com|youtu\.be)$/.test(h)) return 'YouTube';
+  if (/(twitter\.com|x\.com)$/.test(h)) return 'X';
+  if (/threads\.(net|com)$/.test(h)) return 'Threads';
+  if (/bsky\.app$/.test(h)) return 'Bluesky';
+  if (/(facebook\.com|fb\.watch)$/.test(h)) return 'Facebook';
+  if (/twitch\.tv$/.test(h)) return 'Twitch';
+  if (/substack\.com$/.test(h)) return 'Substack';
+  return 'Other';
+}
+// Creator Post Analysis has separate IG / TikTok / "other" columns
+const analysisGroup = (platform) => (platform === 'Instagram' ? 'ig' : platform === 'TikTok' ? 'tiktok' : 'other');
+const ANALYSIS_PLATFORM = { Instagram: 'IG', TikTok: 'TikTok', YouTube: 'Youtube', X: 'X', Threads: 'Threads', Substack: 'Substack' };
+
+const POST_FIELDS = () => Object.values(POSTS.f);
+const KROW_POST_FIELDS = () => [K.f.status, K.f.campaign, K.f.creator, K.f.discordUserId, K.f.discordUsername, K.f.creatorName, K.f.campaignName,
+  K.f.orgName, K.f.postsRequired, K.f.postsAccepted, K.f.postsCompletedAt, K.f.posts, K.f.postsDueBy, K.f.postReminders, K.f.paymentDueDate];
+
+async function postsForRow(krow) {
+  const ids = krow.fields[K.f.posts] || [];
+  return ids.length ? listByIds(POSTS.table, ids, POST_FIELDS()) : [];
+}
+
+async function uploadScreenshot(postId, { base64, contentType, filename }) {
+  const res = await fetch(`https://content.airtable.com/v0/${BASE_ID}/${postId}/${POSTS.f.screenshot}/uploadAttachment`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${process.env.AIRTABLE_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ contentType, file: base64, filename: filename || 'insights.png' }),
+  });
+  if (!res.ok) throw new Error(`screenshot upload ${res.status}: ${(await res.text()).slice(0, 200)}`);
+}
+
+// Recount a creator's accepted posts; mark complete (payment clock starts) or not.
+async function recountPosts(krowId) {
+  const krow = await at.first(K.table, { formula: `RECORD_ID()=${at.q(krowId)}`, fields: KROW_POST_FIELDS() });
+  if (!krow) return null;
+  const posts = await postsForRow(krow);
+  const accepted = posts.filter((p) => p.fields[POSTS.f.status] === 'Approved').length;
+  const required = rowPostsRequired(krow);
+  const wasComplete = !!krow.fields[K.f.postsCompletedAt];
+  const nowComplete = required > 0 && accepted >= required;
+  const update = { [K.f.postsAccepted]: accepted };
+  if (nowComplete && !wasComplete) update[K.f.postsCompletedAt] = now();
+  if (!nowComplete && wasComplete) update[K.f.postsCompletedAt] = null;
+  await at.update(K.table, krow.id, update);
+  Object.assign(krow.fields, update);
+  if (nowComplete && !wasComplete) {
+    const campFields = await campaignFieldsById(first1(krow.fields[K.f.campaign]));
+    const name = first1(krow.fields[K.f.campaignName]) || 'the campaign';
+    const who = first1(krow.fields[K.f.creatorName]) || krow.fields[K.f.discordUsername] || 'A creator';
+    const msg = `🎉 **${who}** has submitted all ${required} post${required === 1 ? '' : 's'} for **${name}**. Payment is now due within 30 days. Mark them paid once it's sent (\`/payments\` or your partner page).`;
+    notifyOrg(campFields, { dmText: msg, subject: `Posts complete: ${who} · ${name}`, body: msg.replace(/\*\*/g, '').replace(/`/g, ''), always: true }).catch((err) => log('notify error', err));
+    await tellCreator(krow, `🎉 All ${required} post${required === 1 ? '' : 's'} for **${name}** are in. Thank you! The partner now has 30 days to pay you, and we'll ask you to confirm when they do.`, `All posts in for ${name}`);
+  }
+  return { krow, accepted, required };
+}
+
+// DM the creator if they're on Discord; email per their setting.
+async function tellCreator(krow, text, subject) {
+  const did = krow.fields[K.f.discordUserId];
+  if (isSnowflake(did)) {
+    const u = await client.users.fetch(did).catch(() => null);
+    if (u) await dm(u, text);
+  }
+  const cid = first1(krow.fields[K.f.creator]);
+  if (cid) {
+    const creator = await at.first(M.table, { formula: `RECORD_ID()=${at.q(cid)}`, fields: CREATOR_CONTACT_FIELDS() });
+    if (creator) await queueEmail({ creator, kind: 'Posts', subject, body: `${hi(creator.fields)}\n\n${text}${pageLine(creator.fields)}` }).catch((err) => log('email error', err));
+  }
+}
+
+// Submit a post. Returns { result, n, accepted, required }.
+async function submitPost({ krowId, link, via, screenshot }) {
+  const url = normalizeLink(link);
+  if (!url) return { result: 'badlink' };
+  const krow = await at.first(K.table, { formula: `RECORD_ID()=${at.q(krowId)}`, fields: KROW_POST_FIELDS() });
+  if (!krow || krow.fields[K.f.status] !== 'Committed') return { result: 'notconfirmed' };
+  const campId = first1(krow.fields[K.f.campaign]);
+  const campFields = await campaignFieldsById(campId);
+  if (!campFields || !postsRequiredOf(campFields)) return { result: 'noposts' };
+  const existing = await postsForRow(krow);
+  if (existing.some((p) => normalizeLink(p.fields[POSTS.f.link]) === url)) return { result: 'duplicate' };
+  const review = !!campFields[C.f.reviewPosts];
+  const platform = detectPlatform(url);
+  const who = first1(krow.fields[K.f.creatorName]) || krow.fields[K.f.discordUsername] || 'Creator';
+  const campName = campFields[C.f.shortName] || 'Campaign';
+  const n = existing.length + 1;
+  const post = await at.create(POSTS.table, {
+    [POSTS.f.title]: `${who} → ${campName} · #${n}`,
+    [POSTS.f.link]: url,
+    [POSTS.f.platform]: platform,
+    [POSTS.f.status]: review ? 'Submitted' : 'Approved',
+    [POSTS.f.submittedAt]: now(),
+    [POSTS.f.via]: via,
+    [POSTS.f.commitment]: [krow.id],
+    [POSTS.f.campaign]: [campId],
+    ...(first1(krow.fields[K.f.creator]) ? { [POSTS.f.creator]: [first1(krow.fields[K.f.creator])] } : {}),
+    ...(review ? {} : { [POSTS.f.reviewedBy]: 'Auto (this campaign doesn’t review posts)', [POSTS.f.reviewedAt]: now() }),
+    ...(screenshot?.url ? { [POSTS.f.screenshot]: [{ url: screenshot.url, filename: screenshot.filename || 'insights.png' }] } : {}),
+  });
+  if (screenshot?.base64) await uploadScreenshot(post.id, screenshot).catch((err) => log('screenshot error', err));
+  // Matching row in Creator Post Analysis, so performance numbers live with your other post data.
+  try {
+    const g = ANALYSIS.f[analysisGroup(platform)];
+    const org = (campFields[C.f.orgName] || []).find(Boolean);
+    const arow = await at.create(ANALYSIS.table, {
+      [ANALYSIS.f.name]: `${who} → ${campName} · post ${n}`,
+      [g.link]: url,
+      ...(ANALYSIS_PLATFORM[platform] ? { [ANALYSIS.f.platforms]: [ANALYSIS_PLATFORM[platform]] } : {}),
+      ...(org ? { [ANALYSIS.f.organization]: org } : {}),
+      [ANALYSIS.f.notes]: `Submitted through the campaign bot (${via}) for ${campName}. Platform: ${platform}.`,
+    });
+    await at.update(POSTS.table, post.id, { [POSTS.f.analysis]: [arow.id] });
+  } catch (err) {
+    log('analysis row error', err);
+  }
+  log(`Post submitted: ${post.id} (${platform}) for ${krow.id}${review ? ', waiting for review' : ''}`);
+  const counted = await recountPosts(krow.id);
+  if (review) notifyPostReviewers(post.id).catch((err) => log('post review notify error', err));
+  return { result: review ? 'postreview' : 'postcounted', n, accepted: counted?.accepted ?? 0, required: counted?.required ?? postsRequiredOf(campFields), postId: post.id };
+}
+
+function postReviewButtons(postId) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`pp:a:${postId}`).setLabel('Approve post').setStyle(ButtonStyle.Success).setEmoji('✅'),
+    new ButtonBuilder().setCustomId(`pp:n:${postId}`).setLabel('Needs changes').setStyle(ButtonStyle.Secondary).setEmoji('✏️')
+  );
+}
+
+// Tell the org a post is waiting for review (DM with buttons + email with partner page link).
+async function notifyPostReviewers(postId) {
+  const p = await at.first(POSTS.table, { formula: `RECORD_ID()=${at.q(postId)}`, fields: POST_FIELDS() });
+  if (!p || p.fields[POSTS.f.status] !== 'Submitted') return;
+  const campFields = await campaignFieldsById(first1(p.fields[POSTS.f.campaign]));
+  if (!campFields) return;
+  const title = p.fields[POSTS.f.title] || 'A post';
+  const link = p.fields[POSTS.f.link];
+  const ids = await orgContactIds(campFields[C.f.orgLinks]);
+  const e = new EmbedBuilder()
+    .setAuthor({ name: '📝  POST TO REVIEW' })
+    .setTitle(title.slice(0, 256))
+    .setURL(link)
+    .setColor(0xe6287e)
+    .setDescription(`${p.fields[POSTS.f.platform] || 'Post'}: ${link}\nApprove it if it meets the campaign's requirements, or ask for changes.`);
+  for (const id of ids) {
+    const u = await client.users.fetch(id).catch(() => null);
+    await u?.send({ embeds: [e], components: [postReviewButtons(p.id)] }).catch(() => {});
+  }
+  const { email, name } = leadContact(campFields);
+  const orgs = (campFields[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.pageLink]) : [];
+  const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
+  if (email) {
+    await queueRawEmail({
+      to: email,
+      kind: 'Post review',
+      subject: `Post to review: ${title}`,
+      body: `Hi ${name ? name.split(' ')[0] : 'there'},\n\n${title} was just submitted: ${link}\n\nPlease approve it or ask for changes${page ? ` on your partner page: [Review posts](${page}#posts)` : ' with the buttons in Discord'}.`,
+    }).catch((err) => log('email error', err));
+  }
+  await at.update(POSTS.table, p.id, { [POSTS.f.notified]: true });
+}
+
+async function reviewPost(postId, approve, reviewer, note = '') {
+  const p = await at.first(POSTS.table, { formula: `RECORD_ID()=${at.q(postId)}`, fields: POST_FIELDS() });
+  if (!p) return 'missing';
+  if (p.fields[POSTS.f.status] !== 'Submitted') return 'postdecided';
+  await at.update(POSTS.table, p.id, {
+    [POSTS.f.status]: approve ? 'Approved' : 'Needs changes',
+    [POSTS.f.reviewedBy]: String(reviewer || '').slice(0, 100),
+    [POSTS.f.reviewedAt]: now(),
+    ...(note ? { [POSTS.f.note]: String(note).slice(0, 2000) } : {}),
+  });
+  const counted = await recountPosts(first1(p.fields[POSTS.f.commitment]));
+  if (counted) {
+    const name = first1(counted.krow.fields[K.f.campaignName]) || 'the campaign';
+    const progress = `${counted.accepted} of ${counted.required}`;
+    if (approve && counted.accepted < counted.required) {
+      await tellCreator(counted.krow, `✅ Your post for **${name}** was approved (${progress} posts done).`, `Post approved: ${name}`);
+    } else if (!approve) {
+      await tellCreator(
+        counted.krow,
+        `✏️ The partner asked for changes to your post for **${name}**: ${p.fields[POSTS.f.link]}` + (note ? `\n> ${String(note).slice(0, 500)}` : '') +
+          `\n\nWhen it's ready, submit the updated link with \`/submit\` in Discord or on your campaigns page. (${progress} posts done.)`,
+        `Changes requested: ${name}`
+      );
+    }
+  }
+  log(`Post ${p.id} ${approve ? 'approved' : 'needs changes'} by ${reviewer}`);
+  return approve ? 'postapproved' : 'postchanges';
+}
+
+async function canReviewPost(userId, postId) {
+  if (await isStaff(userId)) return true;
+  const p = await at.first(POSTS.table, { formula: `RECORD_ID()=${at.q(postId)}`, fields: [POSTS.f.campaign] });
+  const campFields = p ? await campaignFieldsById(first1(p.fields[POSTS.f.campaign])) : null;
+  return (await orgContactIds(campFields?.[C.f.orgLinks])).includes(userId);
+}
+
+async function handlePostReviewButton(interaction) {
+  const [, action, postId] = interaction.customId.split(':');
+  if (action === 'n') {
+    const modal = new ModalBuilder().setCustomId(`ppm:n:${postId}`).setTitle('What needs to change?');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('note').setLabel('Note for the creator').setPlaceholder('e.g. Please tag @ourorg and add the link in your bio').setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(500)
+      )
+    );
+    return interaction.showModal(modal);
+  }
+  const inDm = !interaction.guildId;
+  if (inDm) await interaction.deferUpdate();
+  else await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const text = !(await canReviewPost(interaction.user.id, postId))
+    ? "You're not a reviewer for this campaign."
+    : POST_RESULT_TEXT[await reviewPost(postId, true, interaction.user.globalName || interaction.user.username)];
+  if (inDm) return interaction.editReply({ content: text, components: [] });
+  return interaction.editReply(text);
+}
+
+async function handlePostReviewModal(interaction) {
+  const [, , postId] = interaction.customId.split(':');
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  if (!(await canReviewPost(interaction.user.id, postId))) return interaction.editReply("You're not a reviewer for this campaign.");
+  const note = interaction.fields.getTextInputValue('note') || '';
+  return interaction.editReply(POST_RESULT_TEXT[await reviewPost(postId, false, interaction.user.globalName || interaction.user.username, note)]);
+}
+
+const POST_RESULT_TEXT = {
+  postapproved: '✅ Approved. The creator has been told.',
+  postchanges: '✏️ Sent. The creator has been asked to submit an updated post.',
+  postdecided: 'Someone already reviewed that post.',
+  missing: "We couldn't find that post.",
+};
+
+// /submit link:<url> campaign:<one of my campaigns> screenshot:<image>
+async function myPostCampaigns(userId) {
+  const rows = await at.list(K.table, {
+    formula: `AND({${K.names.discordUserId}}=${at.q(userId)}, {${K.names.status}}="Committed")`,
+    fields: KROW_POST_FIELDS(),
+  });
+  return rows.filter((r) => rowPostsRequired(r) > 0);
+}
+
+async function handleSubmitAutocomplete(interaction) {
+  const rows = await myPostCampaigns(interaction.user.id);
+  const q = String(interaction.options.getFocused() || '').toLowerCase();
+  return interaction.respond(
+    rows
+      .filter((r) => String(first1(r.fields[K.f.campaignName]) || '').toLowerCase().includes(q))
+      .slice(0, 25)
+      .map((r) => ({ name: `${first1(r.fields[K.f.campaignName]) || 'Campaign'} · ${rowPostsAccepted(r)}/${rowPostsRequired(r)} posts`.slice(0, 100), value: r.id }))
+  );
+}
+
+async function handleSubmit(interaction) {
+  const link = interaction.options.getString('link');
+  const chosen = interaction.options.getString('campaign');
+  const shot = interaction.options.getAttachment('screenshot');
+  const rows = await myPostCampaigns(interaction.user.id);
+  if (!rows.length) return interaction.editReply("You don't have any confirmed campaigns that ask for posts. Use `/mycampaigns` to see what you've joined.");
+  let row = chosen ? rows.find((r) => r.id === chosen) : rows.length === 1 ? rows[0] : null;
+  if (!row) {
+    return interaction.editReply(
+      `Which campaign is this post for? Run \`/submit\` again and pick one in the **campaign** box:\n` +
+        rows.map((r) => `• **${first1(r.fields[K.f.campaignName])}** (${rowPostsAccepted(r)}/${rowPostsRequired(r)} posts)`).join('\n')
+    );
+  }
+  if (shot && !String(shot.contentType || '').startsWith('image/')) return interaction.editReply('The screenshot needs to be an image (PNG or JPG).');
+  const res = await submitPost({ krowId: row.id, link, via: 'Discord', screenshot: shot ? { url: shot.url, filename: shot.name } : null });
+  const name = first1(row.fields[K.f.campaignName]) || 'the campaign';
+  const texts = {
+    badlink: "That doesn't look like a link. Paste the full post URL, e.g. https://www.tiktok.com/@you/video/123.",
+    duplicate: "You've already submitted that link for this campaign.",
+    notconfirmed: "You're not confirmed on that campaign.",
+    noposts: "That campaign doesn't track posts.",
+    postcounted: `✅ Post #${res.n} for **${name}** recorded: **${res.accepted} of ${res.required}** posts done.${res.accepted >= res.required ? ' That’s all of them, thank you! 🎉' : ''}`,
+    postreview: `📝 Post #${res.n} for **${name}** submitted. The partner reviews each post, and you'll hear back once it's approved. (${res.accepted} of ${res.required} approved so far.)`,
+  };
+  const tip = shot ? '' : '\n_Tip: add a screenshot of the post’s insights (views/likes) with the **screenshot** option and we’ll track its numbers for you._';
+  return interaction.editReply((texts[res.result] || 'Something went wrong. Please try again.') + (['postcounted', 'postreview'].includes(res.result) ? tip : ''));
+}
+
+// Every ~10 minutes: deadline reminders + copy AI-read numbers into Creator Post Analysis.
+let lastPostTick = 0;
+async function postTick() {
+  if (Date.now() - lastPostTick < 10 * 60_000) return;
+  lastPostTick = Date.now();
+  const today = todayEt();
+  // 1) reminders for creators who still owe posts
+  const owing = await at.list(K.table, { formula: `AND({${K.names.status}}="Committed", {Posts Completed At}="")`, fields: KROW_POST_FIELDS() });
+  for (const r of owing) {
+    const required = rowPostsRequired(r);
+    const due = String(first1(r.fields[K.f.postsDueBy]) || '').slice(0, 10);
+    if (!required || !due) continue;
+    const accepted = rowPostsAccepted(r);
+    if (accepted >= required) continue;
+    const sent = Number(r.fields[K.f.postReminders]) || 0;
+    const daysLeft = Math.round((new Date(due) - new Date(today)) / 86_400_000);
+    const name = first1(r.fields[K.f.campaignName]) || 'your campaign';
+    let msg = null;
+    if (daysLeft <= 3 && daysLeft > 0 && sent < 1) msg = `⏰ Reminder: **${name}** posts are due ${fmtDate(due)}. You've done **${accepted} of ${required}**.`;
+    else if (daysLeft <= 0 && sent < 2) msg = `⏰ **${name}** posts were due ${fmtDate(due)}. You've done **${accepted} of ${required}**. Payment waits until all your posts are in, so submit the rest when you can.`;
+    if (!msg) continue;
+    await tellCreator(r, `${msg}\n\nSubmit each link with \`/submit\` in Discord or on your campaigns page.`, `Posts due for ${name}`);
+    await at.update(K.table, r.id, { [K.f.postReminders]: daysLeft <= 0 ? 2 : 1 });
+  }
+  // 2) AI-read insights → Creator Post Analysis numbers
+  const withInsights = await at.list(POSTS.table, { formula: `{${POSTS.names.insights}}!=""`, fields: [POSTS.f.insights, POSTS.f.metricsCopied, POSTS.f.analysis, POSTS.f.platform] });
+  for (const p of withInsights) {
+    const raw = p.fields[POSTS.f.insights];
+    const text = String(typeof raw === 'object' && raw ? raw.value ?? '' : raw ?? '').trim();
+    if (!text || text === p.fields[POSTS.f.metricsCopied]) continue;
+    const num = (k) => {
+      const m = text.match(new RegExp(`${k}\\s*=\\s*([\\d.,]+)\\s*([kKmM]?)`));
+      if (!m) return null;
+      let n = Number(m[1].replace(/,/g, ''));
+      if (/k/i.test(m[2])) n *= 1e3;
+      if (/m/i.test(m[2])) n *= 1e6;
+      return Number.isFinite(n) ? Math.round(n) : null;
+    };
+    const vals = { views: num('views'), likes: num('likes'), comments: num('comments'), shares: num('shares') };
+    const arow = first1(p.fields[POSTS.f.analysis]);
+    if (arow && Object.values(vals).some((v) => v !== null)) {
+      const g = ANALYSIS.f[analysisGroup(p.fields[POSTS.f.platform])];
+      const upd = {};
+      for (const k of Object.keys(vals)) if (vals[k] !== null) upd[g[k]] = vals[k];
+      await at.update(ANALYSIS.table, arow, upd).catch((err) => log('analysis update error', err));
+      log(`Copied insights for post ${p.id}: ${text}`);
+    }
+    await at.update(POSTS.table, p.id, { [POSTS.f.metricsCopied]: text.slice(0, 250) });
+  }
+}
+
+// Creator page: progress + submit form for a confirmed campaign that asks for posts.
+function postsHtml(krow, posts, token) {
+  const required = rowPostsRequired(krow);
+  if (!required) return '';
+  const mine = (posts || []).filter((p) => (p.fields[POSTS.f.commitment] || []).includes(krow.id));
+  const accepted = mine.filter((p) => p.fields[POSTS.f.status] === 'Approved').length;
+  const due = String(first1(krow.fields[K.f.postsDueBy]) || '').slice(0, 10);
+  const badge = { Approved: '✅', Submitted: '⏳ waiting for review', 'Needs changes': '✏️ needs changes' };
+  const list = mine
+    .map((p) => {
+      const st = p.fields[POSTS.f.status];
+      const note = st === 'Needs changes' && p.fields[POSTS.f.note] ? `<div class="muted">“${esc(p.fields[POSTS.f.note])}”</div>` : '';
+      return `<li><a href="${esc(p.fields[POSTS.f.link])}" target="_blank" rel="noopener">${esc(p.fields[POSTS.f.platform] || 'Post')}</a> · ${esc(badge[st] || st || '')}${note}</li>`;
+    })
+    .join('');
+  const pct = Math.min(100, Math.round((accepted / required) * 100));
+  const done = accepted >= required;
+  return `<div class="posts"><div class="contact-h">📝 Posts · ${accepted} of ${required} done${due && !done ? ` · due ${esc(fmtDate(due))}` : ''}</div>
+  <div class="bar"><i style="width:${pct}%"></i></div>
+  ${list ? `<ul class="postlist">${list}</ul>` : ''}
+  ${done ? '<p class="muted">All your posts are in. Thank you! 🎉</p>' : `<form method="post" action="/c/${token}/post/${krow.id}" class="postform" data-shot>
+    <input name="link" type="url" placeholder="Paste your post link (TikTok, Instagram, YouTube…)" required>
+    <label class="muted">Insights screenshot (optional): <input type="file" accept="image/*" data-file></label>
+    <input type="hidden" name="shot"><input type="hidden" name="shotType"><input type="hidden" name="shotName">
+    <button class="primary">Submit post</button></form>`}
+</div>`;
+}
+
+// Tiny script: turn the chosen screenshot into base64 so the form can post it without extra libraries.
+const POST_FORM_JS = `<script>
+document.querySelectorAll('form[data-shot]').forEach(function(f){f.addEventListener('submit',function(e){
+  var inp=f.querySelector('[data-file]'); if(!inp||!inp.files||!inp.files[0]) return;
+  var file=inp.files[0]; if(file.size>4.5*1024*1024){alert('That screenshot is too big (max 4.5 MB).');e.preventDefault();return;}
+  e.preventDefault(); var r=new FileReader(); r.onload=function(){var s=String(r.result);
+    f.querySelector('[name=shot]').value=s.slice(s.indexOf(',')+1); f.querySelector('[name=shotType]').value=file.type||'image/png';
+    f.querySelector('[name=shotName]').value=file.name||'insights.png'; inp.value=''; f.submit();}; r.readAsDataURL(file);});});
+</script>`;
 
 // ---------- slash commands ----------
 
@@ -2870,6 +3348,12 @@ const commands = [
     .setName('invite')
     .setDescription('For organizations: invite creators to your invite-only campaigns (suggestions, or search by name)')
     .addStringOption((o) => o.setName('creator').setDescription('Search any approved creator by name or handle').setAutocomplete(true).setRequired(false)),
+  new SlashCommandBuilder()
+    .setName('submit')
+    .setDescription('Submit a post link for a campaign you’re confirmed on')
+    .addStringOption((o) => o.setName('link').setDescription('The link to your post (TikTok, Instagram, YouTube…)').setRequired(true))
+    .addStringOption((o) => o.setName('campaign').setDescription('Which campaign (start typing)').setAutocomplete(true).setRequired(false))
+    .addAttachmentOption((o) => o.setName('screenshot').setDescription('Optional: screenshot of the post’s insights so we can track views').setRequired(false)),
   new SlashCommandBuilder().setName('payments').setDescription('For organizations: see payment status for your creators and mark them paid'),
   new SlashCommandBuilder().setName('help').setDescription('How Creator Congress campaigns work'),
 ].map((c) => c.toJSON());
@@ -2955,7 +3439,7 @@ async function handleLink(interaction) {
 async function handleMyCampaigns(interaction) {
   let rows = await at.list(K.table, {
     formula: `AND({${K.names.discordUserId}}=${at.q(interaction.user.id)}, OR({${K.names.status}}="Committed", {${K.names.status}}="Pending", {${K.names.status}}="Invited"))`,
-    fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay, K.f.orgName, K.f.status, K.f.leadContact, K.f.paymentDetails, K.f.paymentStatus, K.f.amountPaid, K.f.paidConfirmedBy, K.f.paymentDueDate],
+    fields: [K.f.campaignName, K.f.campaignStatus, K.f.campaignEndDate, K.f.discordMessageId, K.f.creator, K.f.campaignPay, K.f.orgName, K.f.status, K.f.leadContact, K.f.paymentDetails, K.f.paymentStatus, K.f.amountPaid, K.f.paidConfirmedBy, K.f.paymentDueDate, K.f.postsRequired, K.f.postsAccepted, K.f.campaignEndDate],
   });
   const awaiting = rows.filter((r) => r.fields[K.f.status] === 'Pending' && (Array.isArray(r.fields[K.f.campaignStatus]) ? r.fields[K.f.campaignStatus][0] : r.fields[K.f.campaignStatus]) === C.ACTIVE);
   const invitations = rows.filter((r) => r.fields[K.f.status] === 'Invited' && (Array.isArray(r.fields[K.f.campaignStatus]) ? r.fields[K.f.campaignStatus][0] : r.fields[K.f.campaignStatus]) === C.ACTIVE);
@@ -2980,7 +3464,9 @@ async function handleMyCampaigns(interaction) {
     const hasPay = r.fields[K.f.status] === 'Committed' && String(first(r.fields[K.f.paymentDetails]) || '').trim();
     const contactLine = contact ? `\n╰ 🤝 ${contact}${hasPay ? ' · 💸 payment details posted' : ''}` : '';
     const payLine = r.fields[K.f.status] === 'Committed' && isPaidCampaignRow(r) ? `\n╰ ${PAY_LABEL[payStatusOf(r)]}${payStatusOf(r) === 'Org says paid' ? ': please confirm below' : ''}` : '';
-    return `${title}${details.length ? `\n╰ ${details.join(' · ')}` : ''}${payLine}${contactLine}`;
+    const req = r.fields[K.f.status] === 'Committed' ? rowPostsRequired(r) : 0;
+    const postLine = req ? `\n╰ 📝 Posts ${rowPostsAccepted(r)}/${req}${rowPostsAccepted(r) < req ? ' · submit with `/submit`' : ' ✓'}` : '';
+    return `${title}${details.length ? `\n╰ ${details.join(' · ')}` : ''}${postLine}${payLine}${contactLine}`;
   };
   const active = rows.filter((r) => first(r.fields[K.f.campaignStatus]) === C.ACTIVE);
   const past = rows.filter((r) => first(r.fields[K.f.campaignStatus]) !== C.ACTIVE);
@@ -3078,7 +3564,7 @@ async function handleRoster(interaction) {
     const chunk = messageIds.slice(i, i + 40);
     const rows = await at.list(K.table, {
       formula: `AND(OR({${K.names.status}}="Committed", {${K.names.status}}="Pending", {${K.names.status}}="Invited", {${K.names.status}}="Declined invite"), OR(${chunk.map((m) => `{${K.names.discordMessageId}}=${at.q(m)}`).join(',')}))`,
-      fields: [K.f.creatorName, K.f.discordUserId, K.f.discordUsername, K.f.discordMessageId, K.f.status, K.f.paymentStatus, K.f.campaignPay, K.f.amountPaid, K.f.campaignEndDate, K.f.campaignStatus],
+      fields: [K.f.creatorName, K.f.discordUserId, K.f.discordUsername, K.f.discordMessageId, K.f.status, K.f.paymentStatus, K.f.campaignPay, K.f.amountPaid, K.f.campaignEndDate, K.f.campaignStatus, K.f.postsRequired, K.f.postsAccepted],
     });
     for (const r of rows) {
       if (r.fields[K.f.status] === 'Invited' || r.fields[K.f.status] === 'Declined invite') {
@@ -3136,7 +3622,8 @@ async function handleRoster(interaction) {
         .map((r) => {
           const nm = (r.fields[K.f.creatorName] || [])[0] || r.fields[K.f.discordUsername] || 'Creator';
           const payMark = isPaidCampaignRow(r) && payStatusOf(r) !== 'Not due yet' ? ` · ${PAY_EMOJI[payStatusOf(r)]}` : '';
-          return `› ${nm}${isSnowflake(r.fields[K.f.discordUserId]) ? ` · <@${r.fields[K.f.discordUserId]}>` : ''}${payMark}`;
+          const postMark = rowPostsRequired(r) ? ` · 📝 ${rowPostsAccepted(r)}/${rowPostsRequired(r)}` : '';
+          return `› ${nm}${isSnowflake(r.fields[K.f.discordUserId]) ? ` · <@${r.fields[K.f.discordUserId]}>` : ''}${postMark}${payMark}`;
         })
         .join('\n');
       if (list.length > 800) list = list.slice(0, list.lastIndexOf('\n', 790)) + '\n› …and more (see Airtable)';
@@ -3177,6 +3664,7 @@ async function handleHelp(interaction) {
       { name: '3️⃣  Track your campaigns', value: 'Type `/mycampaigns` to see what you joined and your expected pay (an estimate, not a confirmed payment).' },
       { name: '🙋  Partner-reviewed campaigns', value: 'Some campaigns are reviewed by the partner. Your ✅ is a request, and you get a DM once you’re confirmed.' },
       { name: '✉️  Invitations', value: 'Some campaigns are invite-only. If you’re invited, you’ll get a DM with Accept / No thanks buttons (also in `/mycampaigns`).' },
+      { name: '📝  Submitting posts', value: 'If a campaign asks for posts, type `/submit` with your post link (add a screenshot of its insights if you can). You’ll see your progress in `/mycampaigns`. Payment comes due once all your posts are in.' },
       { name: '💸  Getting paid', value: 'Your contact and payment details appear once you’re confirmed. After a partner marks you paid, you’ll get a DM to confirm it arrived. A payment only counts as **Paid** once you confirm it (or 14 days pass with no reply). Not paid? Tap **Not yet** and we’ll follow up.' },
       { name: '🏢  Partner organizations', value: '`/link` with your organization’s application email, `/roster` to see who signed up, `/review` to approve or decline requests, `/invite` to pick suggested creators, and `/payments` to mark creators paid. Payments are due within 30 days of the campaign’s end.' },
       { name: '🔒  Good to know', value: 'Reactions are public. Command replies are private to you. Closed campaigns don’t take sign-ups.' }
@@ -3189,6 +3677,26 @@ async function handleHelp(interaction) {
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isAutocomplete()) {
     if (interaction.commandName === 'invite') await handleInviteAutocomplete(interaction).catch((err) => log('autocomplete error', err));
+    if (interaction.commandName === 'submit') await handleSubmitAutocomplete(interaction).catch((err) => log('autocomplete error', err));
+    return;
+  }
+  if (interaction.isButton() && interaction.customId.startsWith('pp:')) {
+    try {
+      await handlePostReviewButton(interaction);
+    } catch (err) {
+      log('post review button error', err);
+      const msg = { content: 'Something went wrong on our end. Please try again in a minute.', flags: MessageFlags.Ephemeral };
+      (interaction.replied || interaction.deferred ? interaction.followUp(msg) : interaction.reply(msg)).catch(() => {});
+    }
+    return;
+  }
+  if (interaction.isModalSubmit() && interaction.customId.startsWith('ppm:')) {
+    try {
+      await handlePostReviewModal(interaction);
+    } catch (err) {
+      log('post review modal error', err);
+      (interaction.deferred ? interaction.editReply('Something went wrong. Please try again.') : interaction.reply({ content: 'Something went wrong. Please try again.', flags: MessageFlags.Ephemeral })).catch(() => {});
+    }
     return;
   }
   if (interaction.isButton() && interaction.customId.startsWith('py:')) {
@@ -3234,6 +3742,7 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'review') await handleReview(interaction);
     if (interaction.commandName === 'invite') await handleInviteCommand(interaction);
     if (interaction.commandName === 'payments') await handlePayments(interaction);
+    if (interaction.commandName === 'submit') await handleSubmit(interaction);
   } catch (err) {
     log('command error', err);
     const msg = 'Something went wrong on our end. Please try again in a minute.';
@@ -3257,6 +3766,7 @@ async function poll() {
     await maybeSendWeeklyDigest();
     await ensureOrgTokens();
     await sweepCampaignThreads();
+    await postTick();
     await paymentTick();
     log('Checked Airtable for campaigns to post/close');
   } catch (err) {
