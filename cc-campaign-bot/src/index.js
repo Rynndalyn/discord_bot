@@ -2470,6 +2470,33 @@ function discordButtonHtml(kind, token, linked) {
 <a class="btn-discord" href="/${kind}/${token}/discord">Join on Discord</a></div>`;
 }
 
+// ---------- /portal: one link, two CollabPortals portals ----------
+const CREATOR_PORTAL_URL = process.env.CREATOR_PORTAL_URL || 'https://www.collabportals.com/creator-congress-ltcflw';
+const PARTNER_PORTAL_URL = process.env.PARTNER_PORTAL_URL || 'https://www.collabportals.com/creator-congress-partners-deikxk';
+function portalChooserHtml() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Creator Congress portal</title><meta name="description" content="Sign in to the Creator Congress portal for creators or partner organizations.">
+<style>${PAGE_CSS}
+.choose{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:24px 0}
+.pick{display:block;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;text-decoration:none;color:var(--ink)}
+.pick:hover{border-color:var(--accent);color:var(--ink)}.pick b{display:block;font-size:20px;margin:6px 0 4px}.pick span{color:var(--muted);font-size:15px}
+.pick .go{display:inline-block;margin-top:14px;padding:9px 16px;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;font-weight:700}
+.pick.last{border:2px solid var(--accent)}.lastnote{display:none;font-size:12px;font-weight:700;color:var(--accent);text-transform:uppercase;letter-spacing:.08em}.pick.last .lastnote{display:block}
+@media (max-width:560px){.choose{grid-template-columns:1fr}}
+</style></head><body><div class="wrap">
+${brandHtml('Portal')}
+<header><h1>Sign in to the portal</h1><p>Pick the portal for you. You'll sign in with your email and a one-time code. No password needed.</p></header>
+<div class="choose">
+  <a class="pick" id="creator" href="${esc(CREATOR_PORTAL_URL)}"><span class="lastnote">Last used</span><div style="font-size:30px">🎥</div><b>I'm a creator</b><span>Find partner organizations and campaigns, and track your campaigns, posts and payments.</span><br><span class="go">Creator portal →</span></a>
+  <a class="pick" id="partner" href="${esc(PARTNER_PORTAL_URL)}"><span class="lastnote">Last used</span><div style="font-size:30px">🏢</div><b>I'm a partner organization</b><span>Find creators, manage your campaigns, and see who's working with you.</span><br><span class="go">Partner portal →</span></a>
+</div>
+<p class="muted">Use the email you applied with. Can't sign in? Reply to any Creator Congress email or write to <a href="mailto:hello@creatorcongress.net">hello@creatorcongress.net</a>. New here? <a href="/guide">See how Creator Congress works</a>.</p>
+</div><script>
+try{var k='ccPortal',l=localStorage.getItem(k);if(l&&document.getElementById(l)){var el=document.getElementById(l);el.classList.add('last');el.parentNode.insertBefore(el,el.parentNode.firstChild);}
+document.querySelectorAll('.pick').forEach(function(a){a.addEventListener('click',function(){try{localStorage.setItem(k,a.id)}catch(e){}})});}catch(e){}
+</script></body></html>`;
+}
+
 function startWebServer() {
   const port = Number(process.env.PORT) || 3000;
   const send = (res, code, html, headers = {}) => {
@@ -2487,6 +2514,8 @@ function startWebServer() {
       const dj = url.pathname.match(/^\/(c|o)\/([a-f0-9]{32})\/discord\/?$/);
       if (dj && req.method === 'GET') return discordStart(res, dj[1], dj[2]);
       if (url.pathname === '/discord/callback') return discordCallback(res, url);
+      // One sign-in link for both CollabPortals portals: /portal
+      if (/^\/portal\/?$/.test(url.pathname)) return send(res, 200, portalChooserHtml());
       // Public how-to guide (shareable): the site root and /guide
       if (url.pathname === '/' || /^\/guide\/?$/.test(url.pathname)) {
         return send(res, 200, guideHtml({ css: PAGE_CSS, brand: brandHtml(), discordInvite: process.env.DISCORD_INVITE_URL || '', signup: SIGNUP.img ? `<img src="${SIGNUP.img}" alt="sign-up emoji" class="emo">` : SIGNUP.show }));
