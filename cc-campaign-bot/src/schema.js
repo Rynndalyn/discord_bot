@@ -48,6 +48,9 @@ export const CAMPAIGNS = {
     reviewPosts: 'fldhh72AAzqK7jQ1v', // org approves each post before it counts
     posts: 'fldivsCtv729Vq0Pe', // inverse link to Campaign Posts
     suggestOptIn: 'fldnXDAAdPvQStN7K', // Suggest Creators: shortlist + invites on any campaign, not just invite-only
+    brief: 'fldJtcfaXCM1M6tzQ', // Project Brief (attachments)
+    briefSummary: 'fldMXUtKfEoNVKHTl', // Summary (Project Brief), AI
+    resources: 'fldLJudRQENjcy9ms', // inverse link from Creator Resources
   },
   names: {
     status: 'Active / Inactive',
@@ -265,4 +268,17 @@ export const INBOUND = {
     result: 'fldrh56JPKc7ydzkh',
   },
   names: { status: 'Status' },
+};
+
+// Creator Resources: campaign briefs are copied here so they show up with the other resources (e.g. the portal)
+export const RESOURCES = {
+  table: 'tbllQxUpwmvFE6ZMG',
+  f: {
+    name: 'fldi3FXfXWzJTJsKl',
+    attachments: 'fldYoRrmaSYjlVgQ2',
+    source: 'fldYJqTl8ahhBufRF', // multi select (org name)
+    topic: 'fldMtKH7hSL143WF5',
+    type: 'fldWDprBMhLMg3xPe', // multi select: Brief / Toolkit
+    campaign: 'fldkCGM7LxT9bjUB6', // link to Proposals (set by the bot)
+  },
 };
