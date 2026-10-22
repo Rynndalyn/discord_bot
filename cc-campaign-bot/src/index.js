@@ -28,7 +28,12 @@ import { createServer } from 'node:http';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
 import { guideHtml, DISCORD_GUIDE } from './guide.js';
-import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS, INBOUND, RESOURCES } from './schema.js';
+import * as SCHEMA from './schema.js';
+// Read schema.js as a whole so an older copy of it doesn't stop the bot from starting; newer features just switch off.
+const { BASE_ID, CAMPAIGNS: C, MEMBERS: M, COMMITMENTS: K, ORGS: O, OUTBOX, PORTAL, POSTS, ANALYSIS } = SCHEMA;
+const INBOUND = SCHEMA.INBOUND || null;
+const RESOURCES = SCHEMA.RESOURCES || null;
+const SCHEMA_MISSING = ['INBOUND', 'RESOURCES'].filter((k) => !SCHEMA[k]);
 
 const {
   DISCORD_TOKEN,
@@ -781,6 +786,7 @@ function postLinksIn(text) {
 }
 
 async function inboundTick() {
+  if (!INBOUND) return;
   const rows = await at.list(INBOUND.table, {
     formula: `OR({${INBOUND.names.status}}="", {${INBOUND.names.status}}="New")`,
     fields: Object.values(INBOUND.f),
@@ -859,6 +865,7 @@ async function handleInboundEmail(r) {
 // kept in step when the brief file changes. Rows stay after the campaign ends so the brief remains a resource.
 let lastBriefSync = 0;
 async function syncBriefResources() {
+  if (!RESOURCES || !C.f.brief) return;
   if (Date.now() - lastBriefSync < 10 * 60_000) return; // every 10 minutes is plenty
   lastBriefSync = Date.now();
   const camps = (await at.list(C.table, { formula: `{${C.names.status}}=${at.q(C.ACTIVE)}`, fields: [C.f.shortName, C.f.brief, C.f.orgName, C.f.resources] }))
@@ -4528,6 +4535,7 @@ async function syncGuideChannel(ch, items) {
 
 client.once('clientReady', async () => {
   log(`Logged in as ${client.user.tag}`);
+  if (SCHEMA_MISSING.length) log(`WARNING: schema.js in GitHub is out of date (missing ${SCHEMA_MISSING.join(', ')}). Upload the newest schema.js to turn those features on.`);
   log(`Sign-up emoji: ${SIGNUP.show}${SIGNUP.id ? ' (custom server emoji)' : String(SIGNUP_EMOJI).includes(':') ? ' (WARNING: SIGNUP_EMOJI looks like a custom emoji but isn\'t in <:name:id> form, so it was not used)' : ''}`);
   syncDiscordGuide().catch((err) => log(`Couldn't update the Discord guide: ${err.message}`));
   const guild = client.guilds.cache.get(DISCORD_GUILD_ID);
