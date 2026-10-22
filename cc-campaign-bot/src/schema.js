@@ -282,3 +282,17 @@ export const RESOURCES = {
     campaign: 'fldkCGM7LxT9bjUB6', // link to Proposals (set by the bot)
   },
 };
+
+// Org Team: everyone at a partner org (staff add/remove rows). Used for portal sign-in, /link, Discord access and emails.
+export const TEAM = {
+  table: 'tblECgITTj4vFZcc7',
+  f: {
+    name: 'fld3mMvv7V46poe4u',
+    email: 'fldTxloclz7xBOY5D',
+    org: 'fldIR3Gj4pLLjHluj',
+    role: 'fldbNUp3RGfXF7bqj',
+    getsEmails: 'fldbLYeip1gJF97uq',
+    discordUserId: 'fldcMS2qy9jhdUJ2A',
+  },
+  names: { email: 'Email' },
+};
