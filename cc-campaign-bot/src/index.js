@@ -2254,7 +2254,7 @@ const brandHtml = (label) =>
   `<div class="brand">${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Creator Congress" onerror="this.remove()">` : ''}<span>Creator Congress${label ? ` · ${esc(label)}` : ''}</span></div>`;
 
 const PAGE_CSS = `
-.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
+.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.proposecta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.proposecta p{margin:2px 0 0;font-size:14px}.btn-propose{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;text-decoration:none;font-weight:700}.btn-propose:hover{color:#fff}@media (max-width:560px){.proposecta{flex-direction:column;align-items:flex-start}}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
 :root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
 @media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
 body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
@@ -2627,6 +2627,10 @@ try{var k='ccPortal',l=localStorage.getItem(k);if(l&&document.getElementById(l))
 document.querySelectorAll('.pick').forEach(function(a){a.addEventListener('click',function(){try{localStorage.setItem(k,a.id)}catch(e){}})});}catch(e){}
 </script></body></html>`;
 }
+
+// Proposal form (an Airtable interface form). Pre-fills the organization so the proposal links to the right org.
+const PROPOSAL_FORM_URL = process.env.PROPOSAL_FORM_URL || 'https://airtable.com/apprhrQB4w4vhe06h/pagSsTY1n36bjzLft/form';
+const proposalFormUrl = (org) => `${PROPOSAL_FORM_URL}${PROPOSAL_FORM_URL.includes('?') ? '&' : '?'}prefill_Organization+Applications=${encodeURIComponent(org.id)}`;
 
 function startWebServer() {
   const port = Number(process.env.PORT) || 3000;
@@ -3566,6 +3570,8 @@ async function renderOrgPage(org, token, flash, opts = {}) {
 <p>Review requests, invite creators, see who's confirmed, and track payments.</p></header>
 ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>` : ''}
 ${discordButtonHtml('o', token, (await orgDiscordIds([org])).length > 0)}
+<div class="card proposecta"><div><b>Have a new campaign?</b><p class="muted">Submit a proposal and the Creator Congress team will review it with you before it goes live.</p></div>
+<a class="btn-propose" href="${esc(proposalFormUrl(org))}" target="_blank" rel="noopener">➕ Submit a proposal</a></div>
 <div class="stats">
   <div class="stat"><b>${cnt('Paid')}</b>paid${tot('Paid') ? ` · ${esc(money(tot('Paid')))}` : ''}</div>
   <div class="stat"><b>${cnt('Org says paid')}</b>waiting on creator</div>
