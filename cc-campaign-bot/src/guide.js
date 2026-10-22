@@ -13,7 +13,7 @@ ${brand}
 <header class="hero">
   <h1>How Creator Congress campaigns work</h1>
   <p>Partner organizations post paid and volunteer campaigns. Creators join, make posts and get paid. Here's how it all works, step by step.</p>
-  <div class="cta">${join}<a class="btn ghost" href="#creators">For creators</a><a class="btn ghost" href="#partners">For partner orgs</a></div>
+  <div class="cta"><a class="btn" href="/portal">Sign in to the portal</a>${join}<a class="btn ghost" href="#creators">For creators</a><a class="btn ghost" href="#partners">For partner orgs</a></div>
 </header>
 
 <nav class="toc" aria-label="On this page">
