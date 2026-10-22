@@ -33,7 +33,8 @@ import * as SCHEMA from './schema.js';
 const { BASE_ID, CAMPAIGNS: C, MEMBERS: M, COMMITMENTS: K, ORGS: O, OUTBOX, PORTAL, POSTS, ANALYSIS } = SCHEMA;
 const INBOUND = SCHEMA.INBOUND || null;
 const RESOURCES = SCHEMA.RESOURCES || null;
-const SCHEMA_MISSING = ['INBOUND', 'RESOURCES'].filter((k) => !SCHEMA[k]);
+const TEAM = SCHEMA.TEAM || null;
+const SCHEMA_MISSING = ['INBOUND', 'RESOURCES', 'TEAM'].filter((k) => !SCHEMA[k]);
 
 const {
   DISCORD_TOKEN,
@@ -560,7 +561,7 @@ async function ensureOrgChannel(guild, org) {
 // Lobby permissions: org contacts + staff always; creators who can post if they're on an active campaign,
 // read-only if all their campaigns with this org have ended (so closed threads stay readable).
 async function syncOrgLobby(guild, org, ch, camps) {
-  const orgIds = new Set(idList(org.fields[O.f.discordUserId]).filter(isSnowflake));
+  const orgIds = new Set(await orgDiscordIds([org]));
   const creatorActive = new Map();
   for (const p of camps) {
     const active = p.fields[C.f.status] === C.ACTIVE;
@@ -1151,10 +1152,70 @@ async function isStaff(userId) {
   }
 }
 
+// ---------- Org Team (several people per partner org) ----------
+// Cached for 2 minutes. Team members' Discord IDs count as org contacts (DMs, lobby, threads), and everyone with
+// "Gets Emails" receives the org's campaign emails along with the lead contact. Deleting a row removes their access.
+let teamCache = { at: 0, rows: [] };
+async function teamRows() {
+  if (!TEAM) return [];
+  if (Date.now() - teamCache.at < 120_000) return teamCache.rows;
+  const rows = await at.list(TEAM.table, { fields: Object.values(TEAM.f) }).catch((err) => (log(`Couldn't read Org Team: ${err.message}`), null));
+  if (rows) teamCache = { at: Date.now(), rows };
+  return teamCache.rows;
+}
+const resetTeamCache = () => (teamCache.at = 0);
+async function teamFor(orgIds) {
+  const set = new Set(orgIds || []);
+  return (await teamRows()).filter((t) => (t.fields[TEAM.f.org] || []).some((id) => set.has(id)));
+}
+// Every Discord ID that speaks for these orgs: the org's own list plus each team member's.
+async function orgDiscordIds(orgs) {
+  const team = await teamFor(orgs.map((o) => o.id));
+  return [...new Set([...orgs.flatMap((o) => idList(o.fields[O.f.discordUserId])), ...team.map((t) => t.fields[TEAM.f.discordUserId])].filter(isSnowflake))];
+}
+// Who gets the org's emails for a campaign: the lead contact plus team members with Gets Emails, no duplicates.
+async function orgRecipients(campFields) {
+  const out = [];
+  const add = (email, name) => {
+    const e = String(email || '').trim();
+    if (e && !out.some((x) => x.email.toLowerCase() === e.toLowerCase())) out.push({ email: e, name: String(name || '').trim() });
+  };
+  const lead = leadContact(campFields || {});
+  add(lead.email, lead.name);
+  for (const t of await teamFor(campFields?.[C.f.orgLinks] || [])) if (t.fields[TEAM.f.getsEmails]) add(t.fields[TEAM.f.email], t.fields[TEAM.f.name]);
+  return out;
+}
+const firstName = (name) => (name ? name.split(' ')[0] : 'there');
+
+// Newly approved org with nobody on its Org Team yet → add the applicant as the Lead (gets emails).
+async function ensureOrgLeads() {
+  if (!TEAM) return;
+  const orgs = await at.list(O.table, {
+    formula: `AND({${O.names.approved}}, {Org Team}="", {${O.names.email}}!="")`,
+    fields: [O.f.organization, O.f.firstName, O.f.lastName, O.f.email, O.f.discordUserId],
+    maxRecords: 50,
+  }).catch((err) => (log(`Org Team check skipped: ${err.message}`), []));
+  for (const o of orgs) {
+    const f = o.fields;
+    const name = [f[O.f.firstName], f[O.f.lastName]].map((x) => String(x || '').trim()).filter(Boolean).join(' ') || f[O.f.organization] || 'Lead contact';
+    const did = idList(f[O.f.discordUserId]).find(isSnowflake);
+    await at.create(TEAM.table, {
+      [TEAM.f.name]: name,
+      [TEAM.f.email]: String(f[O.f.email]).trim(),
+      [TEAM.f.org]: [o.id],
+      [TEAM.f.role]: 'Lead',
+      [TEAM.f.getsEmails]: true,
+      ...(did ? { [TEAM.f.discordUserId]: did } : {}),
+    });
+    log(`Added ${name} as Org Team lead for ${f[O.f.organization] || o.id}`);
+  }
+  if (orgs.length) resetTeamCache();
+}
+
 async function orgContactIds(orgLinks) {
   if (!orgLinks?.length) return [];
   const orgs = await listByIds(O.table, orgLinks, [O.f.discordUserId]);
-  return [...new Set(orgs.flatMap((o) => idList(o.fields[O.f.discordUserId]).filter(isSnowflake)))];
+  return orgDiscordIds(orgs);
 }
 
 const REQUEST_FIELDS = () => [K.f.title, K.f.status, K.f.campaign, K.f.creator, K.f.discordUserId, K.f.discordUsername, K.f.discordMessageId, K.f.requestedAt, K.f.reviewedBy];
@@ -1257,10 +1318,9 @@ async function notifyReviewers(recordId, { reminder = false } = {}) {
       (Number.isFinite(reach) && reach > 0 ? ` They have about ${reach.toLocaleString('en-US')} followers.` : '') +
       (cf[M.f.state] ? ` Based in ${cf[M.f.state]}.` : '') +
       `\n\nPlease approve or decline on your partner page (or in Discord with /review). If there's no reply in 7 days, the Creator Congress team will follow up.`;
-    const { email, name } = leadContact(campFields || {});
     const orgs = (campFields?.[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.pageLink]) : [];
     const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
-    if (email) {
+    for (const { email, name } of await orgRecipients(campFields || {})) {
       await queueRawEmail({
         to: email,
         kind: 'Review request',
@@ -2937,21 +2997,22 @@ async function queueRawEmail({ to, subject, body, kind }) {
 async function notifyOrg(campFields, { dmText, subject, body, always = false }) {
   if (!campFields) return;
   const orgs = (campFields[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.discordUserId, O.f.pageLink]) : [];
-  const ids = [...new Set(orgs.flatMap((o) => idList(o.fields[O.f.discordUserId]).filter(isSnowflake)))];
+  const ids = await orgDiscordIds(orgs);
   let sent = 0;
   for (const id of ids) {
     const u = await client.users.fetch(id).catch(() => null);
     if (u && (await dm(u, dmText))) sent++;
   }
-  const { email, name } = leadContact(campFields);
   const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
-  if (email && (always || !sent)) {
-    await queueRawEmail({
-      to: email,
-      kind: 'Payment',
-      subject,
-      body: `Hi ${name ? name.split(' ')[0] : 'there'},\n\n${body}${page ? `\n\n[Open your Creator Congress partner page](${page})` : ''}\n\nQuestions? Reply to the Creator Congress team.`,
-    }).catch((err) => log('email error', err));
+  if (always || !sent) {
+    for (const { email, name } of await orgRecipients(campFields)) {
+      await queueRawEmail({
+        to: email,
+        kind: 'Payment',
+        subject,
+        body: `Hi ${firstName(name)},\n\n${body}${page ? `\n\n[Open your Creator Congress partner page](${page})` : ''}\n\nQuestions? Reply to the Creator Congress team.`,
+      }).catch((err) => log('email error', err));
+    }
   }
 }
 
@@ -3504,7 +3565,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
 <header>${brandHtml('Partner page')}<h1>${esc(org.fields[O.f.organization] || 'Your organization')}</h1>
 <p>Review requests, invite creators, see who's confirmed, and track payments.</p></header>
 ${flash && ORG_FLASH[flash] ? `<div class="flash">${esc(ORG_FLASH[flash])}</div>` : ''}
-${discordButtonHtml('o', token, idList(org.fields[O.f.discordUserId]).some(isSnowflake))}
+${discordButtonHtml('o', token, (await orgDiscordIds([org])).length > 0)}
 <div class="stats">
   <div class="stat"><b>${cnt('Paid')}</b>paid${tot('Paid') ? ` · ${esc(money(tot('Paid')))}` : ''}</div>
   <div class="stat"><b>${cnt('Org says paid')}</b>waiting on creator</div>
@@ -3731,10 +3792,9 @@ async function notifyPostReviewers(postId) {
     const u = await client.users.fetch(id).catch(() => null);
     await u?.send({ embeds: [e], components: [postReviewButtons(p.id)] }).catch((err) => log(`Couldn't DM post review to ${id}: ${err.message}`));
   }
-  const { email, name } = leadContact(campFields);
   const orgs = (campFields[C.f.orgLinks] || []).length ? await listByIds(O.table, campFields[C.f.orgLinks], [O.f.pageLink]) : [];
   const page = orgs.map((o) => o.fields[O.f.pageLink]).find(Boolean);
-  if (email) {
+  for (const { email, name } of await orgRecipients(campFields)) {
     await queueRawEmail({
       to: email,
       kind: 'Post review',
@@ -3989,12 +4049,15 @@ const commands = [
 
 const idList = (s) => String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
 
-function findOrgsByDiscordId(userId) {
-  if (!isSnowflake(userId)) return Promise.resolve([]);
-  return at.list(O.table, {
+async function findOrgsByDiscordId(userId) {
+  if (!isSnowflake(userId)) return [];
+  const direct = await at.list(O.table, {
     formula: `FIND(${at.q(userId)}, {${O.names.discordUserId}}&"")>0`,
     fields: [O.f.organization, O.f.proposals, O.f.discordUserId],
   });
+  // Teammates linked through Org Team
+  const viaTeam = [...new Set((await teamRows()).filter((t) => t.fields[TEAM.f.discordUserId] === userId).flatMap((t) => t.fields[TEAM.f.org] || []))].filter((id) => !direct.some((o) => o.id === id));
+  return viaTeam.length ? [...direct, ...(await listByIds(O.table, viaTeam, [O.f.organization, O.f.proposals, O.f.discordUserId]))] : direct;
 }
 
 async function handleLink(interaction) {
@@ -4002,7 +4065,7 @@ async function handleLink(interaction) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return interaction.editReply("That doesn't look like an email address. Try again with the email you applied with.");
   }
-  const [member, org] = await Promise.all([
+  let [member, org] = await Promise.all([
     at.first(M.table, {
       formula: `AND(LOWER({${M.names.email}})=LOWER(${at.q(email)}), {${M.names.approved}})`,
       fields: [M.f.firstName, M.f.discordUserId],
@@ -4012,6 +4075,16 @@ async function handleLink(interaction) {
       fields: [O.f.organization, O.f.discordUserId],
     }),
   ]);
+  // Not the org's application email? It may be a teammate listed in Org Team.
+  let teamRow = null;
+  if (!org && TEAM) {
+    teamRow = (await teamRows()).find((t) => String(t.fields[TEAM.f.email] || '').trim().toLowerCase() === email.toLowerCase()) || null;
+    const teamOrgId = teamRow ? (teamRow.fields[TEAM.f.org] || [])[0] : null;
+    if (teamOrgId) {
+      const o = await at.first(O.table, { formula: `RECORD_ID()=${at.q(teamOrgId)}`, fields: [O.f.organization, O.f.discordUserId, O.f.approved] });
+      if (o?.fields[O.f.approved]) org = o;
+    }
+  }
   if (!member && !org) {
     return interaction.editReply(
       "I couldn't find an approved Creator Congress member or partner organization with that email. Check for typos, or message a team member for help."
@@ -4020,7 +4093,11 @@ async function handleLink(interaction) {
 
   // Organization contacts: several staff can link to the same org.
   let orgMsg = '';
-  if (org) {
+  if (org && teamRow) {
+    // Teammate: their Discord ID lives on their own Org Team row, so removing the row removes their access.
+    if (teamRow.fields[TEAM.f.discordUserId] !== interaction.user.id) await at.update(TEAM.table, teamRow.id, { [TEAM.f.discordUserId]: interaction.user.id });
+    resetTeamCache();
+  } else if (org) {
     const ids = idList(org.fields[O.f.discordUserId]);
     if (!ids.includes(interaction.user.id)) {
       await at.update(O.table, org.id, { [O.f.discordUserId]: [...ids, interaction.user.id].join(',') });
@@ -4400,6 +4477,7 @@ async function poll() {
     await remindInvites();
     await maybeSendWeeklyDigest();
     await ensureOrgTokens();
+    await ensureOrgLeads();
     await sweepCampaignThreads();
     await postTick();
     await paymentTick();
