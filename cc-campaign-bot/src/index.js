@@ -28,7 +28,7 @@ import { createServer } from 'node:http';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
 import { guideHtml, DISCORD_GUIDE } from './guide.js';
-import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS, INBOUND } from './schema.js';
+import { BASE_ID, CAMPAIGNS as C, MEMBERS as M, COMMITMENTS as K, ORGS as O, OUTBOX, PORTAL, POSTS, ANALYSIS, INBOUND, RESOURCES } from './schema.js';
 
 const {
   DISCORD_TOKEN,
@@ -170,6 +170,11 @@ function buildEmbed(fields, { closed = false, invite = false } = {}) {
   if (modeOf(fields) === 'review' && !closed) {
     e.addFields({ name: '🙋 Partner-reviewed', value: `${org || 'The partner'} reviews each sign-up. React to request a spot, and you'll get a DM once you're confirmed.` });
   }
+  if (briefFiles(fields).length && !closed) {
+    const summary = aiValue(fields[C.f.briefSummary]);
+    const big = briefFiles(fields).length > briefUploads(fields).length;
+    e.addFields({ name: '📄 Project brief', value: `${summary ? `${summary.slice(0, 800)}${summary.length > 800 ? '…' : ''}\n` : ''}*The full brief is attached below${big ? ' (larger files are on your campaigns page)' : ''}.*`.slice(0, 1024) });
+  }
   if (postsRequiredOf(fields) && !closed) {
     e.addFields({ name: '📝 Posts', value: `${postsRequiredOf(fields)} post${postsRequiredOf(fields) === 1 ? '' : 's'} per creator${fields[C.f.postsDueBy] ? `, due ${fmtDate(fields[C.f.postsDueBy])}` : ''}${fields[C.f.reviewPosts] ? ' · reviewed by the partner' : ''}`, inline: false });
   }
@@ -270,12 +275,12 @@ async function publishCampaignPost(rec) {
     const thread = await ch.threads.create({
       name: postTitle(rec.fields),
       autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
-      message: { embeds: [buildEmbed(rec.fields)] },
+      message: { embeds: [buildEmbed(rec.fields)], files: briefUploads(rec.fields) },
       appliedTags: await forumTagsFor(ch, rec.fields),
     });
     msg = await thread.fetchStarterMessage();
   } else {
-    msg = await ch.send({ embeds: [buildEmbed(rec.fields)] });
+    msg = await ch.send({ embeds: [buildEmbed(rec.fields)], files: briefUploads(rec.fields) });
   }
   await msg.react(SIGNUP.react);
   return msg;
@@ -399,7 +404,7 @@ async function refreshPost(rec) {
     const embed = buildEmbed(rec.fields);
     const ch = await campaignChannel();
     const tags = campaignIsForum ? await forumTagsFor(ch, rec.fields) : [];
-    const print = JSON.stringify([embed.toJSON ? embed.toJSON() : embed, postTitle(rec.fields), [...tags].sort()]);
+    const print = JSON.stringify([embed.toJSON ? embed.toJSON() : embed, postTitle(rec.fields), [...tags].sort(), briefPrint(rec.fields)]);
     if (postShown.get(messageId) === print) return;
     // Only treat the post as gone when Discord says so (Unknown Channel / Unknown Message), never on a network blip.
     let msg = null, gone = false;
@@ -423,7 +428,10 @@ async function refreshPost(rec) {
       return;
     }
     if (!msg) return;
-    await msg.edit({ embeds: [embed] });
+    // Re-attach the brief only when it changed (or was never attached), so the files aren't re-uploaded every restart.
+    const attached = [...(msg.attachments?.values?.() || [])].map((a) => a.name).sort().join(',');
+    const wanted = briefUploads(rec.fields).map((a) => a.name).sort().join(',');
+    await msg.edit(attached === wanted ? { embeds: [embed] } : { embeds: [embed], attachments: [], files: briefUploads(rec.fields) });
     // Switched sign-up emoji? Put the new one on older posts (✅ reactions there still count).
     if (msg.react && ![...(msg.reactions?.cache?.values?.() || [])].some((r) => isMainSignup(r.emoji) && r.me)) await msg.react(SIGNUP.react).catch((err) => log(`Couldn't add sign-up emoji: ${err.message}`));
     // ...and take the bot's own old ✅ off, so the new emoji is the one people see (their ✅ reactions stay and count).
@@ -844,6 +852,40 @@ async function handleInboundEmail(r) {
   await reply(logged ? `Got it: post${logged === 1 ? '' : 's'} logged for ${name(target)}` : `About your post for ${name(target)}`, `Here's what happened with what you sent for **${name(target)}**:\n\n${lines.join('\n')}\n\n${progress}`);
   log(`Inbound email ${r.id}: ${logged} post(s) logged for ${target.id} from ${from}`);
   return done(logged ? 'Logged' : 'Needs campaign', `${name(target)}\n${lines.join('\n')}\n${progress}`);
+}
+
+// ---------- campaign briefs → Creator Resources ----------
+// Every active campaign with a Project Brief gets a matching Creator Resources row (Type: Brief, Source: the org),
+// kept in step when the brief file changes. Rows stay after the campaign ends so the brief remains a resource.
+let lastBriefSync = 0;
+async function syncBriefResources() {
+  if (Date.now() - lastBriefSync < 10 * 60_000) return; // every 10 minutes is plenty
+  lastBriefSync = Date.now();
+  const camps = (await at.list(C.table, { formula: `{${C.names.status}}=${at.q(C.ACTIVE)}`, fields: [C.f.shortName, C.f.brief, C.f.orgName, C.f.resources] }))
+    .filter((p) => briefFiles(p.fields).length);
+  for (const p of camps) {
+    const f = p.fields;
+    const files = briefFiles(f);
+    const fields = {
+      [RESOURCES.f.name]: `${f[C.f.shortName] || 'Campaign'}: project brief`,
+      [RESOURCES.f.type]: ['Brief'],
+      ...((f[C.f.orgName] || []).filter(Boolean).length ? { [RESOURCES.f.source]: (f[C.f.orgName] || []).filter(Boolean) } : {}),
+      [RESOURCES.f.campaign]: [p.id],
+    };
+    const existingId = (f[C.f.resources] || [])[0];
+    if (!existingId) {
+      await at.create(RESOURCES.table, { ...fields, [RESOURCES.f.attachments]: files.map((a) => ({ url: a.url, filename: a.filename })) });
+      log(`Added the ${f[C.f.shortName]} brief to Creator Resources`);
+      continue;
+    }
+    const row = (await listByIds(RESOURCES.table, [existingId], [RESOURCES.f.attachments]))[0];
+    const have = (row?.fields[RESOURCES.f.attachments] || []).map((a) => a.filename).sort().join('|');
+    const want = files.map((a) => a.filename).sort().join('|');
+    if (row && have !== want) {
+      await at.update(RESOURCES.table, row.id, { [RESOURCES.f.attachments]: files.map((a) => ({ url: a.url, filename: a.filename })) });
+      log(`Updated the ${f[C.f.shortName]} brief in Creator Resources`);
+    }
+  }
 }
 
 // ---------- members & commitments ----------
@@ -1826,7 +1868,7 @@ function leadContact(f) {
 async function campaignFieldsById(id) {
   if (!id) return null;
   const r = await at.first(C.table, { formula: `RECORD_ID()=${at.q(id)}`, fields: Object.values(C.f) });
-  return r?.fields || null;
+  return r ? { ...r.fields, __id: r.id } : null;
 }
 
 // Markdown block for Discord DMs and emails.
@@ -1903,7 +1945,8 @@ async function announceConfirmed({ campFields, creatorId, discordUserId, user, h
   const need = postsRequiredOf(campFields);
   const postsNote = need ? `\n\n📝 This campaign asks for **${need} post${need === 1 ? '' : 's'}**${campFields[C.f.postsDueBy] ? ` by ${fmtDate(campFields[C.f.postsDueBy])}` : ''}. Submit each link with \`/submit\`${campFields[C.f.reviewPosts] ? ' (the partner approves each one)' : ''}. Payment comes due once they're all in.` : '';
   if (!target && isSnowflake(discordUserId)) noteDm(discordUserId, false);
-  if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}${postsNote}\n\n${contactMd(campFields)}${extra}`);
+  const briefNote = briefMd(campFields, campFields.__id || '');
+  if (target) await dm(target, `${headline || `🎉 You're in! You've been confirmed for **${name}**.`}${channelNote}${postsNote}${briefNote}\n\n${contactMd(campFields)}${extra}`);
   if (creatorId) {
     const contact = await at.first(M.table, { formula: `RECORD_ID()=${at.q(creatorId)}`, fields: CREATOR_CONTACT_FIELDS() });
     if (contact) await emailDecision(contact, campFields, true).catch((err) => log('email error', err));
@@ -1943,6 +1986,7 @@ async function emailDecision(creator, campFields, approved) {
     body: approved
       ? `${hi(cf)}\n\nGood news: you've been confirmed for **${campaignName}**!\n\n` +
         (postsRequiredOf(campFields) ? `This campaign asks for **${postsRequiredOf(campFields)} post(s)**${campFields[C.f.postsDueBy] ? ` by ${fmtDate(campFields[C.f.postsDueBy])}` : ''}. Submit each link on your campaigns page. Payment comes due once they're all in.\n\n` : '') +
+        (briefMd(campFields, campFields.__id) ? `${briefMd(campFields, campFields.__id).trim()}\n\n` : '') +
         `${contactMd(campFields, { email: true })}` +
         (longTerm ? '\n\nThis campaign coordinates in a private Discord thread in the partner’s channel. If you’re not on Discord, the team will help you get set up or keep you updated by email.' : '') +
         pageLine(cf)
@@ -2084,7 +2128,7 @@ async function webJoin(creator, camp, mine, via = 'Web page') {
   if (pending) notifyReviewers(row.id).catch((err) => log('notifyReviewers error', err));
   else {
     scheduleRefresh(key, camp.id);
-    announceConfirmed({ campFields: camp.fields, creatorId: creator.id, discordUserId: did, headline: `✅ You're signed up for **${camp.fields[C.f.shortName] || 'the campaign'}**!` }).catch((err) => log('announce error', err));
+    announceConfirmed({ campFields: { ...camp.fields, __id: camp.id }, creatorId: creator.id, discordUserId: did, headline: `✅ You're signed up for **${camp.fields[C.f.shortName] || 'the campaign'}**!` }).catch((err) => log('announce error', err));
   }
   return pending ? 'requested' : 'joined';
 }
@@ -2143,7 +2187,7 @@ const brandHtml = (label) =>
   `<div class="brand">${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Creator Congress" onerror="this.remove()">` : ''}<span>Creator Congress${label ? ` · ${esc(label)}` : ''}</span></div>`;
 
 const PAGE_CSS = `
-.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
+.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
 :root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
 @media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
 body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
@@ -2194,6 +2238,25 @@ textarea,input{font:inherit;border:1px solid var(--line);border-radius:8px;paddi
 .markpaid{display:flex;flex-wrap:wrap;gap:6px;align-items:center}.markpaid label{font-size:14px;color:var(--muted)}.markpaid input[name=note]{flex:1 1 180px}
 `;
 
+// ---- project brief (Proposals → Project Brief attachments, plus the AI summary) ----
+const aiValue = (v) => String((v && typeof v === 'object' ? v.value : v) || '').trim();
+const briefFiles = (f) => (Array.isArray(f?.[C.f.brief]) ? f[C.f.brief] : []).filter((a) => a?.url);
+const briefLink = (campId, i = 0) => `${publicBase()}/brief/${campId}/${i}`;
+function briefHtml(f, campId) {
+  const files = briefFiles(f);
+  if (!files.length) return '';
+  const summary = aiValue(f[C.f.briefSummary]);
+  return `<div class="brief">📄 <b>Project brief:</b> ${files.map((a, i) => `<a href="/brief/${campId}/${i}" target="_blank" rel="noopener">${esc(a.filename || `Brief ${i + 1}`)}</a>`).join(' · ')}${summary ? `<p class="muted">${esc(summary.slice(0, 600))}${summary.length > 600 ? '…' : ''}</p>` : ''}</div>`;
+}
+function briefMd(f, campId) {
+  const files = briefFiles(f);
+  if (!files.length || !publicBase() || !campId) return '';
+  return `\n\n📄 **Project brief:** ${files.map((a, i) => `[${a.filename || `Brief ${i + 1}`}](${briefLink(campId, i)})`).join(' · ')}`;
+}
+// Discord upload limit is 10 MB per file for most servers; bigger briefs are linked instead.
+const briefUploads = (f) => briefFiles(f).filter((a) => !a.size || a.size <= 9.5 * 1024 * 1024).slice(0, 4).map((a) => ({ attachment: a.url, name: a.filename || 'brief.pdf' }));
+const briefPrint = (f) => briefFiles(f).map((a) => a.id || a.filename).join(',');
+
 function campaignCard(p, { mineRow, inviteRow, token, posts = [] }) {
   const f = p.fields;
   const name = esc(f[C.f.shortName] || 'Campaign');
@@ -2230,6 +2293,7 @@ function campaignCard(p, { mineRow, inviteRow, token, posts = [] }) {
   ${needed ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
   ${tags.length ? `<div class="tags">${tags.map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</div>` : ''}
   ${details ? `<details><summary>Campaign details</summary><p>${esc(details)}</p></details>` : ''}
+  ${briefHtml(f, p.id)}
   ${mode === 'review' && !inviteRow ? `<div class="note">🙋 Partner-reviewed: ${esc(org || 'the partner')} approves each creator. You'll be emailed when you're confirmed.</div>` : ''}
   ${inviteRow ? `<div class="note violet">✉️ You were personally invited to this campaign.</div>` : ''}
   ${status === 'Committed' ? postsHtml(mineRow, posts, token) + paymentHtml(mineRow, token) + contactHtml(f) : ''}
@@ -2514,6 +2578,15 @@ function startWebServer() {
       const dj = url.pathname.match(/^\/(c|o)\/([a-f0-9]{32})\/discord\/?$/);
       if (dj && req.method === 'GET') return discordStart(res, dj[1], dj[2]);
       if (url.pathname === '/discord/callback') return discordCallback(res, url);
+      // Project brief download: always a fresh Airtable link (Airtable's file links expire after a few hours)
+      const bm = url.pathname.match(/^\/brief\/(rec[A-Za-z0-9]{14})\/(\d{1,2})\/?$/);
+      if (bm) {
+        const camp = await at.first(C.table, { formula: `RECORD_ID()=${at.q(bm[1])}`, fields: [C.f.brief] });
+        const file = briefFiles(camp?.fields)[Number(bm[2])];
+        if (!file) return send(res, 404, simple('Brief not found', 'This campaign has no brief attached right now.'));
+        res.writeHead(302, { Location: file.url, 'Cache-Control': 'no-store' });
+        return res.end();
+      }
       // One sign-in link for both CollabPortals portals: /portal
       if (/^\/portal\/?$/.test(url.pathname)) return send(res, 200, portalChooserHtml());
       // Public how-to guide (shareable): the site root and /guide
@@ -3415,6 +3488,7 @@ async function renderOrgPage(org, token, flash, opts = {}) {
         : '<p class="empty">No confirmed creators yet.</p>';
       return `<div class="card"><h3>${esc(f[C.f.shortName] || 'Campaign')}</h3>
   <div class="meta"><span>${f[C.f.status] === C.ACTIVE ? '🟢 Active' : '⚪ Closed'}</span><span>💰 ${f[C.f.creatorPay] ? esc(money(Number(f[C.f.creatorPay]))) + ' per creator' : 'Unpaid / TBD'}</span>${f[C.f.endDate] ? `<span>📅 ends ${esc(fmtDate(f[C.f.endDate]))}</span>` : ''}<span>👥 ${mine.length} confirmed</span>${postsRequiredOf(f) && mine.length ? `<span>📝 ${mine.filter((r) => postInfo(r).done).length} of ${mine.length} finished posting${mine.some((r) => postInfo(r).late) ? ` · ⚠️ ${mine.filter((r) => postInfo(r).late).length} past due` : ''}</span>` : ''}</div>
+  ${briefHtml(f, p.id)}
   ${list}</div>`;
     })
     .join('');
@@ -4311,6 +4385,7 @@ async function poll() {
     await syncCampaignPosts();
     await backfillCommitmentDiscordIds();
     await inboundTick();
+    await syncBriefResources();
     await normalizeJoinModes();
     await ensurePortalTokens();
     await syncInviteCampaigns();
