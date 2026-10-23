@@ -25,6 +25,7 @@ import {
   OverwriteType,
 } from 'discord.js';
 import { createServer } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
 import { guideHtml, DISCORD_GUIDE } from './guide.js';
@@ -2250,11 +2251,47 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const LOGO_URL = process.env.LOGO_URL ?? 'https://images.squarespace-cdn.com/content/v1/667725a3fbb63c107d15b61d/ccf49d96-596f-49f7-942f-aa6aaf9d681e/cclogo.png?format=500w';
 const BRAND_PINK = process.env.BRAND_PINK || '#e6287e';
 const BRAND_ORANGE = process.env.BRAND_ORANGE || '#ff7a1f';
+// ---------- Org guide page (/orgs) and the Resources section on creator and partner pages ----------
+// orgs.html is generated from the "Organizations to Get Involved With" doc. If the file is missing, /orgs is a 404 and
+// the Resources section skips that link.
+let ORGS_HTML = '';
+try { ORGS_HTML = readFileSync(new URL('./orgs.html', import.meta.url), 'utf8'); } catch { console.warn('orgs.html not found: /orgs is off'); }
+const orgsPage = () => ORGS_HTML.replace('{{LOGO}}', LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="" onerror="this.remove()">` : '');
+
+// Toolkits and guides from the Creator Resources table (anything that isn't a campaign brief), refreshed every 10 minutes.
+let toolkitCache = { at: 0, rows: [] };
+async function toolkitRows() {
+  if (!RESOURCES) return [];
+  if (Date.now() - toolkitCache.at < 10 * 60_000) return toolkitCache.rows;
+  try {
+    const rows = await at.list(RESOURCES.table, { fields: [RESOURCES.f.name, RESOURCES.f.attachments, RESOURCES.f.type, RESOURCES.f.source] });
+    toolkitCache = { at: Date.now(), rows: rows.filter((r) => !(r.fields[RESOURCES.f.type] || []).includes('Brief') && (r.fields[RESOURCES.f.attachments] || []).length) };
+  } catch (err) {
+    console.warn('Creator Resources read failed:', err.message);
+    toolkitCache.at = Date.now();
+  }
+  return toolkitCache.rows;
+}
+async function resourcesHtml(audience) {
+  const items = [];
+  if (ORGS_HTML) items.push(['/orgs', 'Organizations to get involved with', 'A searchable map of creator networks, state programs, newsrooms and strategy groups.']);
+  items.push(['/guide' + (audience === 'partner' ? '#partners' : ''), 'How Creator Congress works', audience === 'partner' ? 'Posting campaigns, reviewing creators and paying them.' : 'Joining campaigns, logging posts and getting paid.']);
+  if (audience === 'creator') {
+    for (const r of (await toolkitRows()).slice(0, 12)) {
+      const f = r.fields, file = f[RESOURCES.f.attachments][0];
+      const from = (f[RESOURCES.f.source] || []).join(', ');
+      items.push([file.url, f[RESOURCES.f.name] || file.filename, [(f[RESOURCES.f.type] || []).join(', '), from].filter(Boolean).join(' · ') || 'Download']);
+    }
+  }
+  const link = ([href, t, d]) => `<a class="res" href="${esc(href)}" target="_blank" rel="noopener"><b>${esc(t)} ↗</b><span>${esc(d)}</span></a>`;
+  return `<h2 id="resources">Resources</h2><div class="resgrid">${items.map(link).join('')}</div>`;
+}
+
 const brandHtml = (label) =>
   `<div class="brand">${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Creator Congress" onerror="this.remove()">` : ''}<span>Creator Congress${label ? ` · ${esc(label)}` : ''}</span></div>`;
 
 const PAGE_CSS = `
-.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.proposecta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.proposecta p{margin:2px 0 0;font-size:14px}.btn-propose{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;text-decoration:none;font-weight:700}.btn-propose:hover{color:#fff}@media (max-width:560px){.proposecta{flex-direction:column;align-items:flex-start}}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
+.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.proposecta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.proposecta p{margin:2px 0 0;font-size:14px}.btn-propose{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;text-decoration:none;font-weight:700}.btn-propose:hover{color:#fff}@media (max-width:560px){.proposecta{flex-direction:column;align-items:flex-start}}.resgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin:0 0 8px}.res{display:grid;gap:4px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);text-decoration:none}.res:hover{border-color:var(--accent)}.res b{color:var(--accent)}.res span{font-size:14px;color:var(--muted)}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
 :root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
 @media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
 body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
@@ -2444,6 +2481,7 @@ ${invites.length ? section('✉️ Your invitations', invites.map((x) => campaig
 ${section('Open campaigns', browse.length ? browse.map((p) => campaignCard(p, { mineRow: rowFor(p), token, posts: allPosts })).join('') : '<p class="empty">No open campaigns right now. We’ll email you when new ones are posted.</p>')}
 ${activeMine.length ? section('Your active campaigns', activeMine.map((x) => campaignCard(x.p, { mineRow: x.r, token, posts: allPosts })).join('')) : ''}
 ${pastMine.length ? section('Past campaigns', `<div class="card">${pastMine.map((x) => `<div class="past">✓ <b>${esc(x.p.fields[C.f.shortName])}</b>${payOf(x) ? ` · ${esc(money(payOf(x)))}` : ''}${postsHtml(x.r, allPosts, token)}${paymentHtml(x.r, token)}<details><summary>Contact &amp; payment details</summary>${contactHtml(x.p.fields)}</details></div>`).join('')}</div>`) : ''}
+${await resourcesHtml('creator')}
 <footer>Expected pay is an estimate based on campaign rates. "Paid so far" counts payments you've confirmed you received. This page is private to you, so please don't share the link. Prefer Discord? Join our server and use <b>/link</b> with this email. Questions? Reply to any Creator Congress email.</footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Your campaigns · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div>${POST_FORM_JS}</body></html>`;
 }
@@ -2658,6 +2696,8 @@ function startWebServer() {
         res.writeHead(302, { Location: file.url, 'Cache-Control': 'no-store' });
         return res.end();
       }
+      // Public org guide (shareable)
+      if (/^\/orgs\/?$/.test(url.pathname) && ORGS_HTML) return send(res, 200, orgsPage());
       // One sign-in link for both CollabPortals portals: /portal
       if (/^\/portal\/?$/.test(url.pathname)) return send(res, 200, portalChooserHtml());
       // Public how-to guide (shareable): the site root and /guide
@@ -3584,6 +3624,7 @@ ${suggestHtml}
 ${findHtml}
 <h2>Your campaigns</h2>
 ${campHtml || '<p class="empty">No campaigns yet.</p>'}
+${await resourcesHtml('partner')}
 <footer>This page is private to your organization, so please don't share the link outside your team. Questions? Reply to any Creator Congress email.</footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Partner page · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
 }
@@ -4504,6 +4545,7 @@ function guideEmbed(item) {
   const body = item.body
     .replaceAll('{campaigns}', `<#${CAMPAIGN_CHANNEL_ID}>`)
     .replaceAll('{signup}', SIGNUP.show)
+    .replaceAll('{orgs}', publicBase() ? `${publicBase()}/orgs` : 'the org guide')
     .replaceAll('{guide}', guideUrl || 'the campaigns page');
   return new EmbedBuilder().setAuthor({ name: 'CREATOR CONGRESS · HOW IT WORKS' }).setTitle(item.title.slice(0, 256)).setColor(0xe6287e).setDescription(body.slice(0, 4096));
 }
