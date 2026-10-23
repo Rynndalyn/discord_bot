@@ -13,7 +13,7 @@ ${brand}
 <header class="hero">
   <h1>How Creator Congress campaigns work</h1>
   <p>Partner organizations post paid and volunteer campaigns. Creators join, make posts and get paid. Here's how it all works, step by step.</p>
-  <div class="cta"><a class="btn" href="/portal">Sign in to the portal</a>${join}<a class="btn ghost" href="#creators">For creators</a><a class="btn ghost" href="#partners">For partner orgs</a></div>
+  <div class="cta"><a class="btn" href="/portal">Sign in to the portal</a>${join}<a class="btn ghost" href="#creators">For creators</a><a class="btn ghost" href="#partners">For partner orgs</a><a class="btn ghost" href="/orgs">Orgs to get involved with</a></div>
 </header>
 
 <nav class="toc" aria-label="On this page">
@@ -295,6 +295,23 @@ Command replies are private to you. Reactions on campaign posts are public.
 **Paying creators.** Payment is due within 30 days after the campaign ends, once required posts are in. Click **Mark paid** (or \`/payments\`). It shows as Paid once the creator confirms, or after 14 days.
 
 📄 {guide}#partners`,
+  },
+  {
+    key: 'orgs',
+    channel: 'org-guide',
+    about: 'Organizations to get involved with: creator networks, state programs, newsrooms and strategy groups.',
+    title: '🗺️ Organizations to get involved with',
+    body: `A map of the movement media landscape: where creators can find paid work, training, reporting to build on and community.
+
+**Get paid:** creator networks and agencies like People First, Social Currant and Vocal Media.
+**Go local:** state creator programs in Iowa, Maine, Michigan, Minnesota, New Hampshire, North Carolina, Pennsylvania, Wisconsin and the South.
+**Find the story:** independent and creator-led newsrooms that take tips and pitches.
+**Sharpen the message:** narrative and culture strategy groups with free messaging guides.
+**Fight the noise:** media accountability, tech and AI groups.
+
+**Before you take paid work, ask:** who's funding it (the Code of Conduct asks you to share who pays you somewhere public), whether you keep editorial control, and how and when you get paid.
+
+🗺️ Browse and search all of them: {orgs}`,
   },
   {
     key: 'help',
