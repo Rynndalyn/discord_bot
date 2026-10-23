@@ -28,7 +28,8 @@ import { createServer } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { randomBytes, createHmac, timingSafeEqual } from 'node:crypto';
 import * as at from './airtable.js';
-import { guideHtml, DISCORD_GUIDE } from './guide.js';
+import * as GUIDE from './guide.js';
+const { guideHtml, DISCORD_GUIDE } = GUIDE;
 import * as SCHEMA from './schema.js';
 // Read schema.js as a whole so an older copy of it doesn't stop the bot from starting; newer features just switch off.
 const { BASE_ID, CAMPAIGNS: C, MEMBERS: M, COMMITMENTS: K, ORGS: O, OUTBOX, PORTAL, POSTS, ANALYSIS } = SCHEMA;
@@ -2254,8 +2255,9 @@ const BRAND_ORANGE = process.env.BRAND_ORANGE || '#ff7a1f';
 // ---------- Org guide page (/orgs) and the Resources section on creator and partner pages ----------
 // orgs.html is generated from the "Organizations to Get Involved With" doc. If the file is missing, /orgs is a 404 and
 // the Resources section skips that link.
-let ORGS_HTML = '';
-try { ORGS_HTML = readFileSync(new URL('./orgs.html', import.meta.url), 'utf8'); } catch { console.warn('orgs.html not found: /orgs is off'); }
+// Built into guide.js (ORGS_PAGE), with orgs.html as a fallback if an older guide.js is deployed.
+let ORGS_HTML = GUIDE.ORGS_PAGE || '';
+if (!ORGS_HTML) { try { ORGS_HTML = readFileSync(new URL('./orgs.html', import.meta.url), 'utf8'); } catch { console.warn('Org guide not found: upload the latest guide.js to turn on /orgs'); } }
 const orgsPage = () => ORGS_HTML.replace('{{LOGO}}', LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="" onerror="this.remove()">` : '');
 
 // Toolkits and guides from the Creator Resources table (anything that isn't a campaign brief), refreshed every 10 minutes.
