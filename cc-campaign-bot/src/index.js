@@ -898,6 +898,151 @@ async function syncBriefResources() {
   }
 }
 
+// ---------- Resource library forum (RESOURCE_FORUM_ID) ----------
+// Every Creator Resources row with "Post to Discord" checked becomes one forum post: the file attached (or linked when
+// it's over Discord's upload limit), a description, and tags from Type and Topic. Edits in Airtable update the post;
+// unchecking (or deleting) the row archives and locks it; re-checking brings it back. Creators can reply but not
+// start posts. Runs every 5 minutes.
+const RESOURCE_FORUM_ID = process.env.RESOURCE_FORUM_ID ?? '1564672152119279626';
+const resourceLink = (recId, i = 0) => `${publicBase()}/resource/${recId}/${i}`;
+const libShown = new Map(); // threadId -> fingerprint
+let lastLibSync = 0, libPermsDone = false;
+const resFiles = (f) => (Array.isArray(f?.[RESOURCES.f.attachments]) ? f[RESOURCES.f.attachments] : []).filter((a) => a?.url);
+const resUploads = (f) => resFiles(f).filter((a) => !a.size || a.size <= 9.5 * 1024 * 1024).slice(0, 4).map((a) => ({ attachment: a.url, name: a.filename || 'resource.pdf' }));
+const resTitle = (f) => String(f[RESOURCES.f.name] || resFiles(f)[0]?.filename || 'Resource').trim().slice(0, 100);
+function resEmbed(rec) {
+  const f = rec.fields;
+  let about = String(f[RESOURCES.f.description] || '').trim() || aiValue(f[RESOURCES.f.summary]);
+  if (about.length > 1500) about = about.slice(0, 1500).replace(/\s+\S*$/, '') + '…';
+  const e = new EmbedBuilder().setAuthor({ name: 'CREATOR CONGRESS · RESOURCE LIBRARY' }).setTitle(resTitle(f).slice(0, 256)).setColor(0xe6287e);
+  if (about) e.setDescription(about);
+  const from = (f[RESOURCES.f.source] || []).filter(Boolean).join(', ');
+  if (from) e.addFields({ name: 'From', value: from.slice(0, 1024), inline: true });
+  const kinds = [...(f[RESOURCES.f.type] || []), ...(f[RESOURCES.f.topic] || [])].filter(Boolean).join(', ');
+  if (kinds) e.addFields({ name: 'Topics', value: kinds.slice(0, 1024), inline: true });
+  const big = resFiles(f).map((a, i) => ({ a, i })).filter(({ a }) => a.size > 9.5 * 1024 * 1024);
+  if (big.length && publicBase()) e.addFields({ name: '📎 Download', value: big.map(({ a, i }) => `[${a.filename || 'File'}](${resourceLink(rec.id, i)})`).join('\n').slice(0, 1024) });
+  if (publicBase()) e.addFields({ name: 'More', value: `[Organizations to get involved with](${publicBase()}/orgs) · [How Creator Congress works](${publicBase()}/guide)` });
+  return e;
+}
+async function resourceTags(forum, f) {
+  const wanted = [...(f[RESOURCES.f.type] || []), ...(f[RESOURCES.f.topic] || [])].filter(Boolean);
+  const have = new Map(forum.availableTags.map((t) => [t.name.toLowerCase(), t]));
+  const missing = [...new Set(wanted.filter((n) => !have.has(n.slice(0, 20).toLowerCase())))];
+  if (missing.length && forum.availableTags.length < 20) {
+    try {
+      const add = missing.slice(0, 20 - forum.availableTags.length).map((name) => ({ name: name.slice(0, 20) }));
+      await forum.setAvailableTags([...forum.availableTags.map((t) => ({ id: t.id, name: t.name, moderated: t.moderated, emoji: t.emoji })), ...add]);
+      const fresh = await client.channels.fetch(forum.id, { force: true });
+      fresh.availableTags.forEach((t) => have.set(t.name.toLowerCase(), t));
+    } catch (err) {
+      log(`Couldn't add resource library tags: ${err.message}`);
+    }
+  }
+  return [...new Set(wanted.map((n) => have.get(n.slice(0, 20).toLowerCase())?.id).filter(Boolean))].slice(0, 5);
+}
+async function setLibraryPerms(forum) {
+  if (libPermsDone) return;
+  libPermsDone = true;
+  try {
+    // Members can reply under a resource but can't start new posts; the bot can do both.
+    await forum.permissionOverwrites.edit(forum.guild.roles.everyone, { SendMessages: false, CreatePublicThreads: false }, { type: OverwriteType.Role });
+    await forum.permissionOverwrites.edit(client.user.id, { ViewChannel: true, SendMessages: true, SendMessagesInThreads: true, CreatePublicThreads: true, ManageThreads: true, AttachFiles: true, EmbedLinks: true, ReadMessageHistory: true }, { type: OverwriteType.Member });
+  } catch (err) {
+    log(`Couldn't set resource library permissions (give the bot Manage Channels there, or set them by hand): ${err.message}`);
+  }
+}
+async function setThreadShown(thread, show) {
+  if (show) {
+    if (thread.archived) await thread.setArchived(false).catch(() => {});
+    if (thread.locked) await thread.setLocked(false).catch(() => {});
+  } else if (!thread.archived || !thread.locked) {
+    if (thread.archived) await thread.setArchived(false).catch(() => {});
+    await thread.setLocked(true).catch(() => {});
+    await thread.setArchived(true).catch(() => {});
+    return true;
+  }
+  return false;
+}
+async function syncResourceLibrary() {
+  if (!RESOURCES || !RESOURCE_FORUM_ID || !RESOURCES.f.publish || !client.isReady?.()) return;
+  if (Date.now() - lastLibSync < 5 * 60_000) return;
+  lastLibSync = Date.now();
+  let forum;
+  try {
+    forum = await client.channels.fetch(RESOURCE_FORUM_ID);
+  } catch (err) {
+    log(`Resource library channel ${RESOURCE_FORUM_ID} not found: ${err.message}`);
+    return;
+  }
+  if (!forum || forum.type !== ChannelType.GuildForum) {
+    log(`RESOURCE_FORUM_ID ${RESOURCE_FORUM_ID} isn't a Forum channel, so the resource library is off`);
+    return;
+  }
+  await setLibraryPerms(forum);
+  const rows = await at.list(RESOURCES.table, { fields: Object.values(RESOURCES.f) });
+  const keep = new Set();
+  let made = 0, edited = 0, hidden = 0;
+  for (const rec of rows) {
+    const f = rec.fields;
+    const postId = f[RESOURCES.f.discordPostId];
+    if (postId) keep.add(postId);
+    if (!f[RESOURCES.f.publish]) {
+      if (postId) {
+        const thread = await client.channels.fetch(postId).catch(() => null);
+        if (thread && (await setThreadShown(thread, false))) hidden++;
+        libShown.delete(postId);
+      }
+      continue;
+    }
+    if (!resFiles(f).length && !String(f[RESOURCES.f.description] || '').trim()) continue; // nothing to show yet
+    try {
+      const embed = resEmbed(rec);
+      const tags = await resourceTags(forum, f);
+      const print = JSON.stringify([embed.toJSON(), resTitle(f), [...tags].sort(), resFiles(f).map((a) => a.id || a.filename)]);
+      let thread = null, gone = !postId;
+      if (postId) {
+        try {
+          thread = await client.channels.fetch(postId);
+          if (thread?.parentId !== forum.id) gone = true;
+        } catch (err) {
+          if (err.code === 10003 || err.code === 10008) gone = true;
+          else throw err;
+        }
+      }
+      if (gone) {
+        thread = await forum.threads.create({ name: resTitle(f), autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek, message: { embeds: [embed], files: resUploads(f) }, appliedTags: tags });
+        await at.update(RESOURCES.table, rec.id, { [RESOURCES.f.discordPostId]: thread.id });
+        keep.add(thread.id);
+        libShown.set(thread.id, print);
+        made++;
+        continue;
+      }
+      if (libShown.get(thread.id) === print && !thread.locked) continue;
+      await setThreadShown(thread, true);
+      const msg = await thread.fetchStarterMessage().catch(() => null);
+      if (msg) {
+        const attached = [...(msg.attachments?.values?.() || [])].map((a) => a.name).sort().join(',');
+        const wanted = resUploads(f).map((a) => a.name).sort().join(',');
+        await msg.edit(attached === wanted ? { embeds: [embed] } : { embeds: [embed], attachments: [], files: resUploads(f) });
+      }
+      if (thread.name !== resTitle(f) || String([...thread.appliedTags].sort()) !== String([...tags].sort())) await thread.edit({ name: resTitle(f), appliedTags: tags });
+      if (libShown.has(thread.id)) edited++;
+      libShown.set(thread.id, print);
+    } catch (err) {
+      log(`Resource library: couldn't post ${rec.id} (${resTitle(f)}): ${err.message}`);
+    }
+  }
+  // Posts whose Airtable row was deleted: archive and lock them.
+  try {
+    const active = await forum.threads.fetchActive().catch(() => null);
+    for (const t of active?.threads.values() || []) {
+      if (t.parentId === forum.id && t.ownerId === client.user.id && !keep.has(t.id) && (await setThreadShown(t, false))) hidden++;
+    }
+  } catch {}
+  if (made || edited || hidden) log(`Resource library: ${made} posted, ${edited} updated, ${hidden} archived`);
+}
+
 // ---------- members & commitments ----------
 
 // Sign-ups made on the web before (or without) linking Discord have no Discord ID on the row, so Discord features
@@ -2266,8 +2411,9 @@ async function toolkitRows() {
   if (!RESOURCES) return [];
   if (Date.now() - toolkitCache.at < 10 * 60_000) return toolkitCache.rows;
   try {
-    const rows = await at.list(RESOURCES.table, { fields: [RESOURCES.f.name, RESOURCES.f.attachments, RESOURCES.f.type, RESOURCES.f.source] });
-    toolkitCache = { at: Date.now(), rows: rows.filter((r) => !(r.fields[RESOURCES.f.type] || []).includes('Brief') && (r.fields[RESOURCES.f.attachments] || []).length) };
+    const rows = await at.list(RESOURCES.table, { fields: [RESOURCES.f.name, RESOURCES.f.attachments, RESOURCES.f.type, RESOURCES.f.source, ...(RESOURCES.f.publish ? [RESOURCES.f.publish] : [])] });
+    const shown = (r) => (RESOURCES.f.publish ? r.fields[RESOURCES.f.publish] : !(r.fields[RESOURCES.f.type] || []).includes('Brief'));
+    toolkitCache = { at: Date.now(), rows: rows.filter((r) => shown(r) && (r.fields[RESOURCES.f.attachments] || []).length) };
   } catch (err) {
     console.warn('Creator Resources read failed:', err.message);
     toolkitCache.at = Date.now();
@@ -2282,7 +2428,7 @@ async function resourcesHtml(audience) {
     for (const r of (await toolkitRows()).slice(0, 12)) {
       const f = r.fields, file = f[RESOURCES.f.attachments][0];
       const from = (f[RESOURCES.f.source] || []).join(', ');
-      items.push([file.url, f[RESOURCES.f.name] || file.filename, [(f[RESOURCES.f.type] || []).join(', '), from].filter(Boolean).join(' · ') || 'Download']);
+      items.push([`/resource/${r.id}/0`, f[RESOURCES.f.name] || file.filename, [(f[RESOURCES.f.type] || []).join(', '), from].filter(Boolean).join(' · ') || 'Download']);
     }
   }
   const link = ([href, t, d]) => `<a class="res" href="${esc(href)}" target="_blank" rel="noopener"><b>${esc(t)} ↗</b><span>${esc(d)}</span></a>`;
@@ -2700,6 +2846,15 @@ function startWebServer() {
       }
       // Public org guide (shareable)
       if (/^\/orgs\/?$/.test(url.pathname) && ORGS_HTML) return send(res, 200, orgsPage());
+      // Resource file: always redirects to a fresh Airtable link (theirs expire after a few hours)
+      const rsm = url.pathname.match(/^\/resource\/(rec[A-Za-z0-9]{14})\/(\d)\/?$/);
+      if (rsm && RESOURCES) {
+        const row = await at.first(RESOURCES.table, { formula: `RECORD_ID()=${at.q(rsm[1])}`, fields: [RESOURCES.f.attachments, ...(RESOURCES.f.publish ? [RESOURCES.f.publish] : [])] });
+        const file = row && (!RESOURCES.f.publish || row.fields[RESOURCES.f.publish]) ? resFiles(row.fields)[Number(rsm[2])] : null;
+        if (!file) return send(res, 404, simple('Resource not found', 'This resource may have been removed.'));
+        res.writeHead(302, { Location: file.url, 'Cache-Control': 'no-store' });
+        return res.end();
+      }
       // One sign-in link for both CollabPortals portals: /portal
       if (/^\/portal\/?$/.test(url.pathname)) return send(res, 200, portalChooserHtml());
       // Public how-to guide (shareable): the site root and /guide
@@ -4519,6 +4674,7 @@ async function poll() {
     await backfillCommitmentDiscordIds();
     await inboundTick();
     await syncBriefResources();
+    await syncResourceLibrary();
     await normalizeJoinModes();
     await ensurePortalTokens();
     await syncInviteCampaigns();
