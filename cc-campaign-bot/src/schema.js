@@ -280,6 +280,10 @@ export const RESOURCES = {
     topic: 'fldMtKH7hSL143WF5',
     type: 'fldWDprBMhLMg3xPe', // multi select: Brief / Toolkit
     campaign: 'fldkCGM7LxT9bjUB6', // link to Proposals (set by the bot)
+    summary: 'fldANTtSVPjzdGzAy', // AI summary of the file
+    publish: 'fld3e7mdWLAUg2q9x', // checkbox "Post to Discord": shows in the resource library forum and on creator pages
+    description: 'fld6FcuuXsucqhl6D', // optional; falls back to the AI summary
+    discordPostId: 'fldj2dwXnzRF2efEl', // set by the bot
   },
 };
 
