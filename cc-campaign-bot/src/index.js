@@ -949,6 +949,7 @@ let lastLibSync = 0, libPermsDone = false;
 const resFiles = (f) => (Array.isArray(f?.[RESOURCES.f.attachments]) ? f[RESOURCES.f.attachments] : []).filter((a) => a?.url);
 const resUploads = (f) => resFiles(f).filter((a) => !a.size || a.size <= 9.5 * 1024 * 1024).slice(0, 4).map((a) => ({ attachment: a.url, name: a.filename || 'resource.pdf' }));
 const resTitle = (f) => String(f[RESOURCES.f.name] || resFiles(f)[0]?.filename || 'Resource').trim().slice(0, 100);
+const resLink = (f) => (RESOURCES.f.link && /^https?:\/\//i.test(String(f?.[RESOURCES.f.link] || '').trim()) ? String(f[RESOURCES.f.link]).trim() : '');
 function resEmbed(rec) {
   const f = rec.fields;
   let about = String(f[RESOURCES.f.description] || '').trim() || aiValue(f[RESOURCES.f.summary]);
@@ -959,6 +960,8 @@ function resEmbed(rec) {
   if (from) e.addFields({ name: 'From', value: from.slice(0, 1024), inline: true });
   const kinds = [...(f[RESOURCES.f.type] || []), ...(f[RESOURCES.f.topic] || [])].filter(Boolean).join(', ');
   if (kinds) e.addFields({ name: 'Topics', value: kinds.slice(0, 1024), inline: true });
+  if (resLink(f)) { e.setURL(resLink(f)); e.addFields({ name: '🔗 Link', value: resLink(f).slice(0, 1024) }); }
+  if (f[RESOURCES.f.submittedBy]) e.addFields({ name: 'Shared by', value: String(f[RESOURCES.f.submittedBy]).slice(0, 1024), inline: true });
   const big = resFiles(f).map((a, i) => ({ a, i })).filter(({ a }) => a.size > 9.5 * 1024 * 1024);
   if (big.length && publicBase()) e.addFields({ name: '📎 Download', value: big.map(({ a, i }) => `[${a.filename || 'File'}](${resourceLink(rec.id, i)})`).join('\n').slice(0, 1024) });
   if (publicBase()) e.addFields({ name: 'More', value: `[Organizations to get involved with](${publicBase()}/orgs) · [How Creator Congress works](${publicBase()}/guide)` });
@@ -1034,11 +1037,12 @@ async function syncResourceLibrary() {
       }
       continue;
     }
-    if (!resFiles(f).length && !String(f[RESOURCES.f.description] || '').trim()) continue; // nothing to show yet
+    if (f[RESOURCES.f.needsReview] && RESOURCES.f.needsReview) await at.update(RESOURCES.table, rec.id, { [RESOURCES.f.needsReview]: false }).catch(() => {}); // staff approved it
+    if (!resFiles(f).length && !resLink(f) && !String(f[RESOURCES.f.description] || '').trim()) continue; // nothing to show yet
     try {
       const embed = resEmbed(rec);
       const tags = await resourceTags(forum, f);
-      const print = JSON.stringify([embed.toJSON(), resTitle(f), [...tags].sort(), resFiles(f).map((a) => a.id || a.filename)]);
+      const print = JSON.stringify([embed.toJSON(), resTitle(f), [...tags].sort(), resFiles(f).map((a) => a.id || a.filename), resLink(f)]);
       let thread = null, gone = !postId;
       if (postId) {
         try {
@@ -2450,35 +2454,125 @@ async function toolkitRows() {
   if (!RESOURCES) return [];
   if (Date.now() - toolkitCache.at < 10 * 60_000) return toolkitCache.rows;
   try {
-    const rows = await at.list(RESOURCES.table, { fields: [RESOURCES.f.name, RESOURCES.f.attachments, RESOURCES.f.type, RESOURCES.f.source, ...(RESOURCES.f.publish ? [RESOURCES.f.publish] : [])] });
+    const rows = await at.list(RESOURCES.table, { fields: [RESOURCES.f.name, RESOURCES.f.attachments, RESOURCES.f.type, RESOURCES.f.source, ...[RESOURCES.f.publish, RESOURCES.f.link].filter(Boolean)] });
     const shown = (r) => (RESOURCES.f.publish ? r.fields[RESOURCES.f.publish] : !(r.fields[RESOURCES.f.type] || []).includes('Brief'));
-    toolkitCache = { at: Date.now(), rows: rows.filter((r) => shown(r) && (r.fields[RESOURCES.f.attachments] || []).length) };
+    toolkitCache = { at: Date.now(), rows: rows.filter((r) => shown(r) && ((r.fields[RESOURCES.f.attachments] || []).length || resLink(r.fields))) };
   } catch (err) {
     console.warn('Creator Resources read failed:', err.message);
     toolkitCache.at = Date.now();
   }
   return toolkitCache.rows;
 }
-async function resourcesHtml(audience) {
+async function resourcesHtml(audience, token = '') {
   const items = [];
   if (ORGS_HTML) items.push(['/orgs', 'Organizations to get involved with', 'A searchable map of creator networks, state programs, newsrooms and strategy groups.']);
   items.push(['/guide' + (audience === 'partner' ? '#partners' : ''), 'How Creator Congress works', audience === 'partner' ? 'Posting campaigns, reviewing creators and paying them.' : 'Joining campaigns, logging posts and getting paid.']);
-  if (audience === 'creator') {
-    for (const r of (await toolkitRows()).slice(0, 12)) {
-      const f = r.fields, file = f[RESOURCES.f.attachments][0];
-      const from = (f[RESOURCES.f.source] || []).join(', ');
-      items.push([`/resource/${r.id}/0`, f[RESOURCES.f.name] || file.filename, [(f[RESOURCES.f.type] || []).join(', '), from].filter(Boolean).join(' · ') || 'Download']);
-    }
+  for (const r of (await toolkitRows()).slice(0, audience === 'creator' ? 12 : 6)) {
+    const f = r.fields, file = (f[RESOURCES.f.attachments] || [])[0];
+    const from = (f[RESOURCES.f.source] || []).join(', ');
+    items.push([file ? `/resource/${r.id}/0` : resLink(f), f[RESOURCES.f.name] || file?.filename || 'Resource', [(f[RESOURCES.f.type] || []).join(', '), from].filter(Boolean).join(' · ') || (file ? 'Download' : 'Open link')]);
   }
   const link = ([href, t, d]) => `<a class="res" href="${esc(href)}" target="_blank" rel="noopener"><b>${esc(t)} ↗</b><span>${esc(d)}</span></a>`;
-  return `<h2 id="resources">Resources</h2><div class="resgrid">${items.map(link).join('')}</div>`;
+  return `<h2 id="resources">Resources</h2><div class="resgrid">${items.map(link).join('')}</div>${token && RESOURCES?.f.submittedBy ? shareFormHtml(audience === 'partner' ? 'o' : 'c', token) : ''}`;
+}
+
+// "Share a resource" form on creator and partner pages: a PDF (or other file) and/or a link. It lands in Creator
+// Resources with Needs Review checked; staff publish it by checking Post to Discord.
+const SHARE_TYPES = ['Toolkit', 'Guide', 'Research', 'Brief', 'Other'];
+const SHARE_MAX = 25 * 1024 * 1024;
+function shareFormHtml(kind, token) {
+  return `<details class="share"><summary>➕ Share a resource</summary>
+<form id="shareform" data-url="/${kind}/${token}/share">
+<p class="muted">Share a toolkit, guide, research or link that other creators and partners could use. The Creator Congress team reviews everything before it goes up.</p>
+<label>Title<input name="title" required maxlength="120"></label>
+<label>What is it, and who's it for? <textarea name="description" rows="3" maxlength="1500"></textarea></label>
+<label>Link (optional)<input name="link" type="url" placeholder="https://"></label>
+<label>File (optional, PDF preferred, up to 25 MB)<input name="file" type="file" accept=".pdf,.png,.jpg,.jpeg,.docx,.pptx"></label>
+<label>Type<select name="type">${SHARE_TYPES.map((t) => `<option>${t}</option>`).join('')}</select></label>
+<button class="btn-propose" type="submit">Send for review</button> <span id="sharemsg" class="muted"></span>
+</form></details>
+<script>(function(){var f=document.getElementById('shareform');if(!f)return;var m=document.getElementById('sharemsg');
+f.addEventListener('submit',function(e){e.preventDefault();var d=new FormData(f),file=d.get('file');
+if(!d.get('link')&&!(file&&file.size)){m.textContent='Add a link or a file.';return;}
+if(file&&file.size>${SHARE_MAX}){m.textContent='That file is over 25 MB. Share a link to it instead.';return;}
+var b=f.querySelector('button');b.disabled=true;m.textContent='Sending…';
+var send=function(data,name,type){fetch(f.dataset.url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:d.get('title'),description:d.get('description'),link:d.get('link'),type:d.get('type'),fileName:name,fileType:type,fileData:data})})
+.then(function(r){return r.json()}).then(function(j){b.disabled=false;if(j.ok){f.reset();m.textContent='Thanks! The team will review it and post it to the resource library.';}else{m.textContent=j.error||'Something went wrong. Try again.';}})
+.catch(function(){b.disabled=false;m.textContent='Something went wrong. Try again.';});};
+if(file&&file.size){var rd=new FileReader();rd.onload=function(){send(String(rd.result).split(',')[1],file.name,file.type)};rd.readAsDataURL(file);}else send('','','');});})();</script>`;
+}
+
+// Uploaded files are held in memory just long enough for Airtable to fetch them (it copies attachments from a URL).
+const tmpFiles = new Map(); // id -> { buf, type, name, exp }
+function holdTmpFile(buf, type, name) {
+  const now = Date.now();
+  for (const [k, v] of tmpFiles) if (v.exp < now) tmpFiles.delete(k);
+  const id = randomBytes(16).toString('hex');
+  tmpFiles.set(id, { buf, type: type || 'application/octet-stream', name, exp: now + 60 * 60_000 });
+  return `${publicBase()}/tmpfile/${id}/${encodeURIComponent(name)}`;
+}
+function readJson(req, maxBytes) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { req.destroy(); resolve(null); } else chunks.push(c);
+    });
+    req.on('end', () => { try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { resolve(null); } });
+    req.on('error', () => resolve(null));
+  });
+}
+async function shareResource(kind, token, body) {
+  if (!RESOURCES?.f.submittedBy) return { error: 'Sharing is not set up yet.' };
+  let who, links = {}, source;
+  if (kind === 'c') {
+    const c = await creatorByToken(token);
+    if (!c || !c.fields[M.f.approved]) return { error: 'This link has expired.' };
+    who = `${String(c.fields[M.f.fullName] || '').trim() || 'A creator'} (creator)`;
+    links = { [RESOURCES.f.sharedByCreator]: [c.id] };
+  } else {
+    const o = await orgByToken(token);
+    if (!o || !o.fields[O.f.approved]) return { error: 'This link has expired.' };
+    source = String(o.fields[O.f.organization] || '').trim();
+    who = `${source || 'A partner'} (partner)`;
+    links = { [RESOURCES.f.sharedByOrg]: [o.id] };
+  }
+  const title = String(body?.title || '').trim().slice(0, 120);
+  const link = String(body?.link || '').trim();
+  if (!title) return { error: 'Add a title.' };
+  if (link && !/^https?:\/\/\S+$/i.test(link)) return { error: 'The link should start with https://' };
+  let attachments = [];
+  if (body?.fileData) {
+    const buf = Buffer.from(String(body.fileData), 'base64');
+    const name = String(body.fileName || 'resource.pdf').replace(/[\\/\r\n]/g, '_').slice(0, 120);
+    if (!/\.(pdf|png|jpe?g|docx|pptx)$/i.test(name)) return { error: 'Please share a PDF, image, Word or PowerPoint file.' };
+    if (buf.length > SHARE_MAX) return { error: 'That file is over 25 MB. Share a link to it instead.' };
+    attachments = [{ url: holdTmpFile(buf, String(body.fileType || ''), name), filename: name }];
+  }
+  if (!link && !attachments.length) return { error: 'Add a link or a file.' };
+  const type = SHARE_TYPES.includes(body?.type) ? body.type : 'Other';
+  const row = await at.create(RESOURCES.table, {
+    [RESOURCES.f.name]: title,
+    [RESOURCES.f.description]: String(body?.description || '').trim().slice(0, 1500),
+    ...(link ? { [RESOURCES.f.link]: link } : {}),
+    ...(attachments.length ? { [RESOURCES.f.attachments]: attachments } : {}),
+    [RESOURCES.f.type]: [type],
+    ...(source ? { [RESOURCES.f.source]: [source] } : {}),
+    [RESOURCES.f.submittedBy]: who,
+    ...links,
+    [RESOURCES.f.needsReview]: true,
+  });
+  log(`Resource shared by ${who}: ${title} (${row.id})`);
+  await staffNote(`📚 **New resource to review** from ${who}: **${title}**${link ? `\n${link}` : ''}\nIn Airtable → Creator Resources, check **Post to Discord** to publish it, or delete the row.`);
+  return { ok: true };
 }
 
 const brandHtml = (label) =>
   `<div class="brand">${LOGO_URL ? `<img src="${esc(LOGO_URL)}" alt="Creator Congress" onerror="this.remove()">` : ''}<span>Creator Congress${label ? ` · ${esc(label)}` : ''}</span></div>`;
 
 const PAGE_CSS = `
-.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.proposecta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.proposecta p{margin:2px 0 0;font-size:14px}.btn-propose{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;text-decoration:none;font-weight:700}.btn-propose:hover{color:#fff}@media (max-width:560px){.proposecta{flex-direction:column;align-items:flex-start}}.resgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin:0 0 8px}.res{display:grid;gap:4px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);text-decoration:none}.res:hover{border-color:var(--accent)}.res b{color:var(--accent)}.res span{font-size:14px;color:var(--muted)}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
+.discordcta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.discordcta p{margin:2px 0 0;font-size:14px}.btn-discord{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:#5865f2;color:#fff;text-decoration:none;font-weight:700}.discordline{margin:12px 0;font-size:14px}.proposecta{display:flex;align-items:center;justify-content:space-between;gap:14px;margin:16px 0}.proposecta p{margin:2px 0 0;font-size:14px}.btn-propose{flex:none;display:inline-block;padding:10px 16px;border-radius:999px;background:linear-gradient(90deg,var(--accent),var(--accent2));color:#fff;text-decoration:none;font-weight:700}.btn-propose:hover{color:#fff}@media (max-width:560px){.proposecta{flex-direction:column;align-items:flex-start}}.resgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px;margin:0 0 8px}.res{display:grid;gap:4px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--ink);text-decoration:none}.res:hover{border-color:var(--accent)}.res b{color:var(--accent)}.res span{font-size:14px;color:var(--muted)}.share{margin:8px 0 16px;padding:12px 14px;border:1px dashed var(--line);border-radius:12px;background:var(--card)}.share summary{cursor:pointer;font-weight:700;color:var(--accent)}.share form{display:grid;gap:10px;margin-top:10px}.share label{display:grid;gap:4px;font-size:14px;font-weight:600}.share input,.share textarea,.share select{font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}.brief{margin:10px 0;padding:10px 12px;border-radius:10px;background:var(--soft);font-size:15px}.brief p{margin:6px 0 0;font-size:14px}@media (max-width:560px){.discordcta{flex-direction:column;align-items:flex-start}}
 :root{--bg:#fff8f5;--card:#fff;--ink:#24151c;--muted:#6e5a63;--line:#f1dfe4;--accent:${BRAND_PINK};--accent2:${BRAND_ORANGE};--accent-ink:#fff;--soft:#fde8f1;--warn:#b4520a;--warn-soft:#fff0e2;--violet:#a2266b;--violet-soft:#fbe4f0;--ok:#1f7a4d;--ok-soft:#e8f3ec}
 @media (prefers-color-scheme:dark){:root{--bg:#170f13;--card:#22161c;--ink:#f6ecef;--muted:#c0a9b3;--line:#3a2630;--accent:#ff5fa2;--accent2:#ff9a4d;--accent-ink:#1a0a11;--soft:#3a1a2a;--warn:#ffb070;--warn-soft:#3a2414;--violet:#ff8cc6;--violet-soft:#3a1a2e;--ok:#4cc38a;--ok-soft:#1f3329}}
 body::before{content:"";display:block;height:6px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
@@ -2668,7 +2762,7 @@ ${invites.length ? section('✉️ Your invitations', invites.map((x) => campaig
 ${section('Open campaigns', browse.length ? browse.map((p) => campaignCard(p, { mineRow: rowFor(p), token, posts: allPosts })).join('') : '<p class="empty">No open campaigns right now. We’ll email you when new ones are posted.</p>')}
 ${activeMine.length ? section('Your active campaigns', activeMine.map((x) => campaignCard(x.p, { mineRow: x.r, token, posts: allPosts })).join('')) : ''}
 ${pastMine.length ? section('Past campaigns', `<div class="card">${pastMine.map((x) => `<div class="past">✓ <b>${esc(x.p.fields[C.f.shortName])}</b>${payOf(x) ? ` · ${esc(money(payOf(x)))}` : ''}${postsHtml(x.r, allPosts, token)}${paymentHtml(x.r, token)}<details><summary>Contact &amp; payment details</summary>${contactHtml(x.p.fields)}</details></div>`).join('')}</div>`) : ''}
-${await resourcesHtml('creator')}
+${await resourcesHtml('creator', token)}
 <footer>Expected pay is an estimate based on campaign rates. "Paid so far" counts payments you've confirmed you received. This page is private to you, so please don't share the link. Prefer Discord? Join our server and use <b>/link</b> with this email. Questions? Reply to any Creator Congress email.</footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Your campaigns · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div>${POST_FORM_JS}</body></html>`;
 }
@@ -2893,6 +2987,22 @@ function startWebServer() {
         if (!file) return send(res, 404, simple('Resource not found', 'This resource may have been removed.'));
         res.writeHead(302, { Location: file.url, 'Cache-Control': 'no-store' });
         return res.end();
+      }
+      // Held upload, fetched once by Airtable when a shared resource is saved
+      const tf = url.pathname.match(/^\/tmpfile\/([a-f0-9]{32})(?:\/[^/]*)?$/);
+      if (tf) {
+        const held = tmpFiles.get(tf[1]);
+        if (!held || held.exp < Date.now()) return send(res, 404, simple('File not found', 'This upload has expired.'));
+        res.writeHead(200, { 'Content-Type': held.type, 'Content-Length': held.buf.length, 'Content-Disposition': `attachment; filename="${held.name.replace(/"/g, '')}"`, 'Cache-Control': 'no-store' });
+        return res.end(held.buf);
+      }
+      // Share a resource from a creator or partner page
+      const sh = url.pathname.match(/^\/(c|o)\/([a-f0-9]{32})\/share\/?$/);
+      if (sh && req.method === 'POST') {
+        const body = await readJson(req, Math.ceil(SHARE_MAX * 1.4) + 20_000);
+        const out = body ? await shareResource(sh[1], sh[2], body).catch((err) => (log('Share resource failed', err), { error: 'Something went wrong. Try again.' })) : { error: 'That file is too big. Share a link to it instead.' };
+        res.writeHead(out.ok ? 200 : 400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify(out));
       }
       // One sign-in link for both CollabPortals portals: /portal
       if (/^\/portal\/?$/.test(url.pathname)) return send(res, 200, portalChooserHtml());
@@ -3820,7 +3930,7 @@ ${suggestHtml}
 ${findHtml}
 <h2>Your campaigns</h2>
 ${campHtml || '<p class="empty">No campaigns yet.</p>'}
-${await resourcesHtml('partner')}
+${await resourcesHtml('partner', token)}
 <footer>This page is private to your organization, so please don't share the link outside your team. Questions? Reply to any Creator Congress email.</footer>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Partner page · Creator Congress</title><style>${PAGE_CSS}</style></head><body><div class="wrap">${body}</div></body></html>`;
 }
