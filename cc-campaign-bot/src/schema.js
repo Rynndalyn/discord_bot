@@ -18,7 +18,8 @@ export const CAMPAIGNS = {
     status: 'fldCBeJvXbj7jq6XI', // "🟢 Active" / "🟡 Inactive"
     postToDiscord: 'fldTaMVfK5XWwS56Q',
     discordMessageId: 'fldhnttrw4Qlxy5Nl',
-    discordClosed: 'fldMECgdek4YwfOgr',
+    discordClosed: 'fldMECgdek4YwfOgr', // staff switch: check to close a campaign everywhere
+    postClosed: 'fldApp23aD0GTTet8', // bot-owned: whether the Discord post is currently closed
     signups: 'fldywNk9SbHcVALa7',
     orgName: 'fldZXf8wiFZ8tMrxV',
     orgLinks: 'fldKj2zkQwqTzh6Y8',
@@ -68,9 +69,11 @@ export const CAMPAIGNS = {
     postToDiscord: 'Post to Discord',
     discordMessageId: 'Discord Message ID',
     discordClosed: 'Discord Closed',
+    postClosed: 'Discord Post Closed (bot)',
     suggestOptIn: 'Suggest Creators',
   },
   ACTIVE: '🟢 Active',
+  INACTIVE: '🟡 Inactive',
 };
 
 export const MEMBERS = {
