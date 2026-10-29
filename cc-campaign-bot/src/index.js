@@ -304,7 +304,7 @@ async function deleteCampaignPost(messageId) {
   if (old) await old.delete().catch((err) => log(`Couldn't delete old post ${messageId}: ${err.message}`));
 }
 
-// Forum posts: closed campaigns are locked and archived (they drop out of the main list); reopened ones come back.
+// Forum posts: lock/archive or reopen a post (closed campaigns are removed from the forum in editPost).
 async function setForumPostOpen(messageId, open) {
   if (!campaignIsForum || isInviteKey(messageId)) return;
   const thread = await client.channels.fetch(messageId).catch(() => null);
@@ -409,6 +409,15 @@ async function syncCampaignPosts() {
       } // else: it was closed and someone set it back to Active, so re-open (editPost unchecks Discord Closed)
     }
     if (wantClosed !== shownClosed || (wantClosed && !f[C.f.discordClosed])) await editPost(channel, rec, wantClosed);
+    else if (wantClosed && campaignIsForum && !isInviteKey(f[C.f.discordMessageId]) && !forumCleared.has(f[C.f.discordMessageId])) {
+      // Closed before closed posts were removed from the forum: remove it now (once).
+      forumCleared.add(f[C.f.discordMessageId]);
+      const thread = await client.channels.fetch(f[C.f.discordMessageId]).catch(() => null);
+      if (thread?.parentId === channel.id) {
+        await deleteCampaignPost(f[C.f.discordMessageId]);
+        log(`Removed closed campaign ${rec.id} from the forum`);
+      }
+    }
   }
 
   // 4) Refresh: an open post whose Airtable details changed (pay, dates, description, tags...) gets edited in place.
@@ -474,15 +483,28 @@ async function refreshPost(rec) {
   }
 }
 
+const forumCleared = new Set(); // closed forum posts already removed (checked once per restart)
 async function editPost(channel, rec, closed) {
   const messageId = rec.fields[C.f.discordMessageId];
   try {
     if (!isInviteKey(messageId)) {
-      if (!closed) await setForumPostOpen(messageId, true); // unarchive first so the card can be edited
-      const msg = await fetchCampaignMessage(messageId);
-      if (!msg) throw new Error('post not found');
-      await msg.edit({ embeds: [buildEmbed(rec.fields, { closed })] });
-      if (closed) await setForumPostOpen(messageId, false);
+      if (closed && campaignIsForum) {
+        // Forums keep archived posts in the list, so closed campaigns are removed from the forum entirely.
+        // Sign-ups, posts and payments stay in Airtable; re-opening posts it fresh (see below).
+        await deleteCampaignPost(messageId);
+        forumCleared.add(messageId);
+      } else {
+        if (!closed) await setForumPostOpen(messageId, true); // unarchive first so the card can be edited
+        const msg = await fetchCampaignMessage(messageId);
+        if (!msg && !closed && campaignIsForum) {
+          // Re-opened after its forum post was removed: post it again (sign-ups carry over).
+          await at.update(C.table, rec.id, { [C.f.repost]: true });
+        } else {
+          if (!msg) throw new Error('post not found');
+          await msg.edit({ embeds: [buildEmbed(rec.fields, { closed })] });
+          if (closed) await setForumPostOpen(messageId, false);
+        }
+      }
     }
   } catch (err) {
     log(`Could not edit message ${messageId} for ${rec.id} (deleted?): ${err.message}`);
