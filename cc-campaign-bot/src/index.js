@@ -326,6 +326,16 @@ async function syncCampaignPosts() {
   const channel = await campaignChannel();
   const campaignFields = Object.values(C.f);
 
+  // 0) Discord Closed checked on an active campaign that was never posted: just set it to Inactive.
+  const closeUnposted = await at.list(C.table, {
+    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.discordClosed}}, {${C.names.discordMessageId}}="")`,
+    fields: [C.f.status],
+  });
+  for (const rec of closeUnposted) {
+    await at.update(C.table, rec.id, { [C.f.status]: C.INACTIVE });
+    log(`Campaign ${rec.id}: Discord Closed checked, set to Inactive`);
+  }
+
   // 1) New: Active + Post to Discord + not yet posted
   const toPost = await at.list(C.table, {
     formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.postToDiscord}}, {${C.names.discordMessageId}}="", {${C.names.joinMode}}!="Invite-only")`,
@@ -333,7 +343,7 @@ async function syncCampaignPosts() {
   });
   for (const rec of toPost) {
     const msg = await publishCampaignPost(rec);
-    await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false });
+    await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false, ...(C.f.postClosed ? { [C.f.postClosed]: false } : {}) });
     campaignByMessage.set(msg.id, campaignInfo(rec));
     log(`Posted campaign ${rec.id} as message ${msg.id}`);
     if (hasThread(rec.fields)) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.discordMessageId]: msg.id } });
@@ -352,7 +362,7 @@ async function syncCampaignPosts() {
     }
     await deleteCampaignPost(oldId);
     const msg = await publishCampaignPost(rec);
-    await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false, [C.f.repost]: false });
+    await at.update(C.table, rec.id, { [C.f.discordMessageId]: msg.id, [C.f.discordClosed]: false, ...(C.f.postClosed ? { [C.f.postClosed]: false } : {}), [C.f.repost]: false });
     // Move every sign-up to the new post. People who'd reacted on the old post are marked so the
     // reaction check doesn't withdraw them (their old reaction went away with the old post).
     const rows = await at.list(K.table, { formula: `{${K.names.discordMessageId}}=${at.q(oldId)}`, fields: [K.f.joinedVia, K.f.status] });
@@ -376,22 +386,29 @@ async function syncCampaignPosts() {
   });
   for (const rec of needChannel) await syncCampaignChannel(rec);
 
-  // 2) Close: posted, no longer Active, not yet marked closed
-  const toClose = await at.list(C.table, {
-    formula: `AND({${C.names.status}}!=${at.q(C.ACTIVE)}, {${C.names.discordMessageId}}!="", NOT({${C.names.discordClosed}}))`,
+  // 2) Close / re-open. Two ways to close: set Active / Inactive to Inactive, or check "Discord Closed" (which also
+  //    sets the campaign to Inactive, so it drops off every page, list and reminder). To re-open, set it back to
+  //    Active; the bot unchecks Discord Closed. "Discord Post Closed (bot)" remembers what the post shows now.
+  const P = C.f.postClosed, PN = C.names.postClosed;
+  const toCheck = await at.list(C.table, {
+    formula: `AND({${C.names.discordMessageId}}!="", OR({${C.names.status}}!=${at.q(C.ACTIVE)}, {${C.names.discordClosed}}${PN ? `, {${PN}}` : ''}))`,
     fields: campaignFields,
   });
-  for (const rec of toClose) {
-    await editPost(channel, rec, true);
-  }
-
-  // 3) Re-open: posted + closed, but switched back to Active
-  const toReopen = await at.list(C.table, {
-    formula: `AND({${C.names.status}}=${at.q(C.ACTIVE)}, {${C.names.discordMessageId}}!="", {${C.names.discordClosed}})`,
-    fields: campaignFields,
-  });
-  for (const rec of toReopen) {
-    await editPost(channel, rec, false);
+  for (const rec of toCheck) {
+    const f = rec.fields;
+    const active = f[C.f.status] === C.ACTIVE;
+    const shownClosed = P ? Boolean(f[P]) : Boolean(f[C.f.discordClosed]);
+    let wantClosed = !active;
+    if (active && f[C.f.discordClosed] && P) {
+      if (!shownClosed) {
+        // Staff checked Discord Closed on an active campaign: close it everywhere.
+        await at.update(C.table, rec.id, { [C.f.status]: C.INACTIVE });
+        f[C.f.status] = C.INACTIVE;
+        log(`Campaign ${rec.id}: Discord Closed checked, set to Inactive`);
+        wantClosed = true;
+      } // else: it was closed and someone set it back to Active, so re-open (editPost unchecks Discord Closed)
+    }
+    if (wantClosed !== shownClosed || (wantClosed && !f[C.f.discordClosed])) await editPost(channel, rec, wantClosed);
   }
 
   // 4) Refresh: an open post whose Airtable details changed (pay, dates, description, tags...) gets edited in place.
@@ -470,7 +487,7 @@ async function editPost(channel, rec, closed) {
   } catch (err) {
     log(`Could not edit message ${messageId} for ${rec.id} (deleted?): ${err.message}`);
   }
-  await at.update(C.table, rec.id, { [C.f.discordClosed]: closed });
+  await at.update(C.table, rec.id, { [C.f.discordClosed]: closed, ...(C.f.postClosed ? { [C.f.postClosed]: closed } : {}) });
   campaignByMessage.set(messageId, { ...campaignInfo(rec), closed });
   log(`${closed ? 'Closed' : 'Re-opened'} campaign ${rec.id}`);
   if (hasThread(rec.fields)) await syncCampaignChannel({ ...rec, fields: { ...rec.fields, [C.f.status]: closed ? 'closed' : C.ACTIVE } });
@@ -1732,7 +1749,7 @@ async function sendInvites(rec) {
   if (modeOf(f) !== 'invite' && (!f[C.f.discordMessageId] || isInviteKey(f[C.f.discordMessageId]))) return;
   const key = f[C.f.discordMessageId] || inviteKey(rec.id);
   if (!f[C.f.discordMessageId]) {
-    await at.update(C.table, rec.id, { [C.f.discordMessageId]: key, [C.f.discordClosed]: false });
+    await at.update(C.table, rec.id, { [C.f.discordMessageId]: key, [C.f.discordClosed]: false, ...(C.f.postClosed ? { [C.f.postClosed]: false } : {}) });
     rec.fields[C.f.discordMessageId] = key;
   }
   const invitedIds = f[C.f.invited] || [];
