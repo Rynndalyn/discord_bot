@@ -287,6 +287,11 @@ export const RESOURCES = {
     publish: 'fld3e7mdWLAUg2q9x', // checkbox "Post to Discord": shows in the resource library forum and on creator pages
     description: 'fld6FcuuXsucqhl6D', // optional; falls back to the AI summary
     discordPostId: 'fldj2dwXnzRF2efEl', // set by the bot
+    link: 'fldBvxurpChlLcTCV', // web link (instead of, or as well as, a file)
+    submittedBy: 'fldC4vsBBxFia2VV6', // who shared it from their page
+    sharedByCreator: 'fldp64c1LDmkqTZko', // link to Creator Applications
+    sharedByOrg: 'flduBd9diIx81MMap', // link to Organization Applications
+    needsReview: 'fld3b44V2VevjeDfK', // shared by a creator/partner, waiting for staff
   },
 };
 
